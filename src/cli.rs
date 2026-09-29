@@ -21,6 +21,37 @@ Features:
   • Works out-of-the-box without authentication for public Chromium issues.";
 
 const AFTER_LONG_HELP: &str = "\
+QUERY SYNTAX (-Q / --query):
+  The -Q / --query flag accepts the Google Issue Tracker search query language and can be
+  used standalone or combined with -u/--assignee, --reporter, --cc, and -s/--status:
+
+  • User filters:
+      assignee:<email>          Issues assigned to user
+      reporter:<email>          Issues reported by user
+      cc:<email>                Issues where user is CC'd
+      commentby:<email>         Issues with comments by user
+      verifier:<email>          Issues verified by user
+
+  • Date & time filters (YYYY-MM-DD, YYYY-MM-DD..YYYY-MM-DD, <, <=, >, >=, or Nd for last N days):
+      modified:2026-07-01..2026-09-30   Modified within a date range (e.g. Q3)
+      resolved:2026-07-01..2026-09-30   Resolved/fixed within a date range
+      created:2026-07-01..2026-09-30    Created within a date range
+      verified:2026-07-01..2026-09-30   Verified within a date range
+      modified>=2026-07-01              Modified on or after a date
+      modified:7d                       Modified in the last 7 days
+
+  • Field & metadata filters:
+      status:open | status:closed | status:(ASSIGNED|ACCEPTED|FIXED|VERIFIED|...)
+      priority:(P0|P1|P2|P3|P4)
+      severity:(S0|S1|S2|S3|S4)
+      type:(BUG|FEATURE_REQUEST|VULNERABILITY|TASK|...)
+      componentid:<id>          Filter by numeric component ID (e.g. componentid:1456526)
+      hotlistid:<id>            Filter by hotlist ID
+      title:\"<phrase>\"          Match phrase in issue title
+
+  • Boolean operators:
+      Space is implicit AND; use OR, |, parentheses (...), and -<term> for negation.
+
 EXAMPLES:
   1. Print an issue in Markdown to stdout (default):
      $ crbugs 563075803
@@ -41,14 +72,19 @@ EXAMPLES:
      $ crbugs --assignee eugene@chromium.org --status fixed
      $ crbugs -u eugene@chromium.org -s assigned,accepted --limit 20
 
-  6. Emit structured JSON to stdout:
+  6. Find all issues worked on or resolved in a quarter (e.g. Q3) using -Q:
+     $ crbugs -u eugene@chromium.org -Q \"modified:2026-07-01..2026-09-30\" -l 100
+     $ crbugs -u eugene@chromium.org -s fixed,verified -Q \"resolved:2026-07-01..2026-09-30\" -l 100
+     $ crbugs -Q \"(assignee:eugene@chromium.org OR commentby:eugene@chromium.org) modified:2026-07-01..2026-09-30\" -l 200
+
+  7. Emit structured JSON to stdout:
      $ crbugs 563075803 --format json
      $ crbugs -u eugene@chromium.org -s fixed --format json
 
-  7. Limit output to the initial description plus the last 10 comments:
+  8. Limit output to the initial description plus the last 10 comments:
      $ crbugs 563075803 --max-comments 10
 
-  8. Include field-change history (status, assignee, component, label diffs) in the timeline:
+  9. Include field-change history (status, assignee, component, label diffs) in the timeline:
      $ crbugs 563075803 --include-field-updates";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -102,7 +138,8 @@ pub struct Cli {
     )]
     pub status: Vec<String>,
 
-    /// Raw Issue Tracker search query string (can be combined with --assignee and --status)
+    /// Issue Tracker search query (e.g. "modified:2026-07-01..2026-09-30", "resolved>=2026-07-01",
+    /// "commentby:user@chromium.org", "priority:P0|P1"). Can be combined with -u and -s
     #[arg(short = 'Q', long = "query", value_name = "QUERY")]
     pub query: Option<String>,
 
