@@ -9,12 +9,12 @@ use anyhow::{Context, Result};
 use std::io::Write;
 
 use crate::attachments::download_bundle_attachments;
-use crate::cli::{ parse_issue_id, Cli, OutputFormat };
+use crate::cli::{parse_issue_id, Cli, OutputFormat};
 use crate::client::CrbugClient;
 use crate::markdown::render_issue_markdown;
 use crate::models::AttachmentDownloadStatus;
 
-pub async fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Cli) -> Result<()> {
     let issue_id = parse_issue_id(&cli.issue)?;
 
     let client = CrbugClient::new(
@@ -27,9 +27,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         eprintln!("Fetching issue {} from {}...", issue_id, cli.base_url);
     }
 
-    let mut bundle = client
-        .fetch_issue_bundle(issue_id, cli.include_field_updates, cli.max_comments)
-        .await?;
+    let mut bundle =
+        client.fetch_issue_bundle(issue_id, cli.include_field_updates, cli.max_comments)?;
 
     let output_path = cli.resolved_output_path(issue_id);
     let attachments_dir = cli.resolved_attachments_dir(issue_id);
@@ -50,8 +49,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             cli.max_attachment_size,
             cli.concurrency,
             cli.quiet,
-        )
-        .await?;
+        )?;
     }
 
     let rendered = match cli.format {
@@ -67,13 +65,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     if let Some(ref path) = output_path {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
+                std::fs::create_dir_all(parent)
                     .with_context(|| format!("Failed to create directory {}", parent.display()))?;
             }
         }
-        tokio::fs::write(path, rendered.as_bytes())
-            .await
+        std::fs::write(path, rendered.as_bytes())
             .with_context(|| format!("Failed to write output file {}", path.display()))?;
 
         if !cli.quiet {

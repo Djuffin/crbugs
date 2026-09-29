@@ -8,8 +8,8 @@ use tempfile::tempdir;
 
 const TEST_ISSUE_ID: i64 = 563075803;
 
-#[tokio::test]
-async fn test_fetch_and_export_issue_563075803() {
+#[test]
+fn test_fetch_and_export_issue_563075803() {
     let client = CrbugClient::new(
         "https://issues.chromium.org".to_string(),
         "https://usercontent.issues.chromium.org".to_string(),
@@ -19,7 +19,6 @@ async fn test_fetch_and_export_issue_563075803() {
 
     let mut bundle = client
         .fetch_issue_bundle(TEST_ISSUE_ID, true, None)
-        .await
         .expect("Failed to fetch issue 563075803");
 
     // 1. Verify Title & Description
@@ -80,7 +79,6 @@ async fn test_fetch_and_export_issue_563075803() {
         4,
         true,
     )
-    .await
     .expect("Failed to download attachments for 563075803");
 
     for expected_name in ["analyze.py", "seek_test.html", "seq_server.py"] {
@@ -91,7 +89,10 @@ async fn test_fetch_and_export_issue_563075803() {
             .unwrap_or_else(|| panic!("Missing attachment {}", expected_name));
         assert_eq!(att.download_status, AttachmentDownloadStatus::Downloaded);
         let local_path = att.local_path.as_ref().expect("Missing local_path");
-        assert!(local_path.exists(), "Attachment file does not exist on disk");
+        assert!(
+            local_path.exists(),
+            "Attachment file does not exist on disk"
+        );
         let metadata = std::fs::metadata(local_path).unwrap();
         assert!(metadata.len() > 0, "Downloaded attachment is empty");
     }
@@ -111,8 +112,8 @@ async fn test_fetch_and_export_issue_563075803() {
     assert!(md.contains("./attachments/82130205_seq_server.py"));
 }
 
-#[tokio::test]
-async fn test_cli_end_to_end_563075803() {
+#[test]
+fn test_cli_end_to_end_563075803() {
     let tmp = tempdir().expect("Failed to create temp dir");
     let out_file = tmp.path().join("exported.md");
     let att_dir = tmp.path().join("files");
@@ -127,7 +128,7 @@ async fn test_cli_end_to_end_563075803() {
         "--quiet",
     ]);
 
-    crbugs::run(cli).await.expect("CLI run failed");
+    crbugs::run(cli).expect("CLI run failed");
 
     assert!(out_file.exists());
     let content = std::fs::read_to_string(&out_file).unwrap();

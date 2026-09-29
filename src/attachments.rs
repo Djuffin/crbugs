@@ -1,15 +1,15 @@
 use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::client::CrbugClient;
 use crate::models::{AttachmentDownloadStatus, AttachmentMeta, IssueBundle};
 
-/// Downloads all eligible attachments for `bundle` concurrently into `attachments_dir`,
-/// updating both `bundle.attachments`, `bundle.description`, and `bundle.comments`
-/// with the resulting local and relative paths.
-pub async fn download_bundle_attachments(
+/// Downloads all eligible attachments for `bundle` concurrently into `attachments_dir`
+/// using a bounded pool of OS worker threads (`std::thread::scope`), updating
+/// `bundle.attachments`, `bundle.description`, and `bundle.comments` with local and relative paths.
+pub fn download_bundle_attachments(
     client: &CrbugClient,
     bundle: &mut IssueBundle,
     attachments_dir: &Path,
@@ -28,76 +28,74 @@ pub async fn download_bundle_attachments(
         .any(|a| !a.is_deleted && a.size_bytes <= max_attachment_size);
 
     if has_downloadable {
-        tokio::fs::create_dir_all(attachments_dir)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to create attachments directory {}",
-                    attachments_dir.display()
-                )
-            })?;
+        std::fs::create_dir_all(attachments_dir).with_context(|| {
+            format!(
+                "Failed to create attachments directory {}",
+                attachments_dir.display()
+            )
+        })?;
     }
 
-    let concurrency = concurrency.max(1);
+    let worker_count = concurrency.max(1).min(bundle.attachments.len());
     let issue_id = bundle.issue_id;
-    let attachments_dir_owned = attachments_dir.to_path_buf();
     let md_parent = markdown_file_path
         .and_then(|p| p.parent())
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(Path::to_path_buf);
+        .filter(|p| !p.as_os_str().is_empty());
 
-    let updated_attachments: Vec<AttachmentMeta> = stream::iter(bundle.attachments.clone())
-        .map(|mut att| {
-            let client = client.clone();
-            let dir = attachments_dir_owned.clone();
-            let md_parent = md_parent.clone();
-            async move {
+    let queue = Mutex::new(bundle.attachments.clone().into_iter());
+    let results: Mutex<HashMap<i64, AttachmentMeta>> =
+        Mutex::new(HashMap::with_capacity(bundle.attachments.len()));
+
+    std::thread::scope(|s| {
+        for _ in 0..worker_count {
+            s.spawn(|| loop {
+                let next_att = {
+                    let mut guard = queue.lock().expect("queue lock poisoned");
+                    guard.next()
+                };
+                let Some(mut att) = next_att else {
+                    break;
+                };
+
                 if att.is_deleted {
                     att.download_status = AttachmentDownloadStatus::DeletedOnServer;
-                    return att;
-                }
-                if att.size_bytes > max_attachment_size {
+                } else if att.size_bytes > max_attachment_size {
                     att.download_status = AttachmentDownloadStatus::SkippedTooLarge;
-                    return att;
-                }
-
-                let dest_path = dir.join(&att.sanitized_filename);
-                match client
-                    .download_attachment_to_path(issue_id, att.attachment_id, &dest_path)
-                    .await
-                {
-                    Ok(bytes_written) => {
-                        if bytes_written > 0 && att.size_bytes == 0 {
-                            att.size_bytes = bytes_written;
+                } else {
+                    let dest_path = attachments_dir.join(&att.sanitized_filename);
+                    match client.download_attachment_to_path(issue_id, att.attachment_id, &dest_path)
+                    {
+                        Ok(bytes_written) => {
+                            if bytes_written > 0 && att.size_bytes == 0 {
+                                att.size_bytes = bytes_written;
+                            }
+                            let rel = compute_relative_link(md_parent, &dest_path);
+                            att.relative_path = Some(rel);
+                            att.local_path = Some(dest_path);
+                            att.download_status = AttachmentDownloadStatus::Downloaded;
                         }
-                        let rel = compute_relative_link(md_parent.as_deref(), &dest_path);
-                        att.relative_path = Some(rel);
-                        att.local_path = Some(dest_path);
-                        att.download_status = AttachmentDownloadStatus::Downloaded;
-                    }
-                    Err(err) => {
-                        if !quiet {
-                            eprintln!(
-                                "warning: failed to download attachment {} ({}): {}",
-                                att.attachment_id, att.filename, err
-                            );
+                        Err(err) => {
+                            if !quiet {
+                                eprintln!(
+                                    "warning: failed to download attachment {} ({}): {}",
+                                    att.attachment_id, att.filename, err
+                                );
+                            }
+                            att.download_status = AttachmentDownloadStatus::Failed(err.to_string());
                         }
-                        att.download_status = AttachmentDownloadStatus::Failed(err.to_string());
                     }
                 }
-                att
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
 
-    let mut by_id: HashMap<i64, AttachmentMeta> = updated_attachments
-        .into_iter()
-        .map(|a| (a.attachment_id, a))
-        .collect();
+                results
+                    .lock()
+                    .expect("results lock poisoned")
+                    .insert(att.attachment_id, att);
+            });
+        }
+    });
 
-    // Preserve original attachment order
+    let by_id = results.into_inner().expect("results lock poisoned");
+
     for att in &mut bundle.attachments {
         if let Some(updated) = by_id.get(&att.attachment_id) {
             *att = updated.clone();
@@ -114,14 +112,8 @@ pub async fn download_bundle_attachments(
 
     for comment in &mut bundle.comments {
         for att in &mut comment.attachments {
-            if let Some(updated) = by_id.remove(&att.attachment_id).or_else(|| {
-                bundle
-                    .attachments
-                    .iter()
-                    .find(|a| a.attachment_id == att.attachment_id)
-                    .cloned()
-            }) {
-                *att = updated;
+            if let Some(updated) = by_id.get(&att.attachment_id) {
+                *att = updated.clone();
             }
         }
     }
