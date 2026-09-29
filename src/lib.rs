@@ -5,23 +5,76 @@ pub mod jspb;
 pub mod markdown;
 pub mod models;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 
 use crate::attachments::download_bundle_attachments;
 use crate::cli::{parse_issue_id, Cli, OutputFormat};
 use crate::client::CrbugClient;
-use crate::markdown::render_issue_markdown;
+use crate::markdown::{render_issue_markdown, render_search_markdown};
 use crate::models::AttachmentDownloadStatus;
 
 pub fn run(cli: Cli) -> Result<()> {
-    let issue_id = parse_issue_id(&cli.issue)?;
-
     let client = CrbugClient::new(
         cli.base_url.clone(),
         cli.usercontent_url.clone(),
         cli.cookie.clone(),
     )?;
+
+    if let Some(search_query) = cli.build_search_query()? {
+        if !cli.quiet {
+            eprintln!(
+                "Searching issues on {} for `{}` (limit {}, sort `{}`)...",
+                cli.base_url, search_query, cli.limit, cli.sort
+            );
+        }
+
+        let search_result = client.search_issues(&search_query, &cli.sort, cli.limit)?;
+
+        let rendered = match cli.format {
+            OutputFormat::Markdown => render_search_markdown(&search_result),
+            OutputFormat::Json => {
+                let mut s = serde_json::to_string_pretty(&search_result)
+                    .context("Failed to serialize SearchIssuesResult to JSON")?;
+                s.push('\n');
+                s
+            }
+        };
+
+        if let Some(ref path) = cli.resolved_search_output_path() {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("Failed to create directory {}", parent.display())
+                    })?;
+                }
+            }
+            std::fs::write(path, rendered.as_bytes())
+                .with_context(|| format!("Failed to write output file {}", path.display()))?;
+
+            if !cli.quiet {
+                eprintln!(
+                    "Exported {} search result(s) (of {} total) to {}",
+                    search_result.issues.len(),
+                    search_result.total_size,
+                    path.display()
+                );
+            }
+        } else {
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(rendered.as_bytes())
+                .context("Failed to write to stdout")?;
+            stdout.flush()?;
+        }
+
+        return Ok(());
+    }
+
+    let raw_issue = cli.issue.as_deref().ok_or_else(|| {
+        anyhow!("Missing issue identifier or search filter (try --help for usage)")
+    })?;
+    let issue_id = parse_issue_id(raw_issue)?;
 
     if !cli.quiet {
         eprintln!("Fetching issue {} from {}...", issue_id, cli.base_url);

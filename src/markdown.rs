@@ -3,6 +3,7 @@ use std::fmt::Write;
 use crate::attachments::format_byte_size;
 use crate::models::{
     AttachmentDownloadStatus, AttachmentMeta, CommentEntry, FormattingMode, IssueBundle,
+    SearchIssuesResult,
 };
 
 /// Renders an `IssueBundle` into a complete Markdown document.
@@ -400,3 +401,77 @@ fn escape_table_cell(s: &str) -> String {
 fn escape_md_heading(s: &str) -> String {
     s.replace('\n', " ")
 }
+
+/// Renders a `SearchIssuesResult` into a Markdown table document.
+pub fn render_search_markdown(result: &SearchIssuesResult) -> String {
+    let mut out = String::with_capacity(4096);
+
+    let _ = writeln!(out, "# Chromium Issue Search Results\n");
+    let _ = writeln!(out, "- **Query:** `{}`", result.query);
+    let _ = writeln!(out, "- **Sort:** `{}`", result.sort_by);
+    let approx = if result.total_size_accurate || result.total_size <= result.issues.len() {
+        ""
+    } else {
+        "+"
+    };
+    let _ = writeln!(
+        out,
+        "- **Showing:** {} of {}{} issues\n",
+        result.issues.len(),
+        result.total_size,
+        approx
+    );
+
+    if result.issues.is_empty() {
+        let _ = writeln!(out, "*No matching issues found.*");
+        return out;
+    }
+
+    let _ = writeln!(
+        out,
+        "| ID | Status | Priority | Type | Modified | Component | Title |"
+    );
+    let _ = writeln!(
+        out,
+        "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |"
+    );
+
+    for issue in &result.issues {
+        let modified_str = issue
+            .modified_time
+            .map(|t| t.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "-".to_string());
+
+        let component = issue
+            .custom_fields
+            .iter()
+            .find(|cf| cf.id == 1222907 || cf.name == "Component Tags")
+            .map(|cf| cf.value.clone())
+            .or_else(|| {
+                if !issue.component_path.is_empty() {
+                    Some(issue.component_path.join(" > "))
+                } else if issue.component_id > 0 {
+                    Some(issue.component_id.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "-".to_string());
+
+        let _ = writeln!(
+            out,
+            "| [{}]({}) | `{}` | `{}` | `{}` | {} | {} | {} |",
+            issue.issue_id,
+            issue.url,
+            issue.status,
+            issue.priority,
+            issue.issue_type,
+            modified_str,
+            escape_table_cell(&component),
+            escape_table_cell(&issue.title),
+        );
+    }
+
+    out
+}
+

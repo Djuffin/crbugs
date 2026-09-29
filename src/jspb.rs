@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use crate::models::{
     AttachmentDownloadStatus, AttachmentMeta, CommentEntry, FieldDiff, FormattingMode, IssueBundle,
-    ResolvedCustomField,
+    ResolvedCustomField, SearchIssuesResult,
 };
 
 const GROUPING_WINDOW_SECS: i64 = 3600;
@@ -323,6 +323,15 @@ pub fn parse_issue_fetch_response(
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("Missing issuetracker.v1.Issue at fe.Issue[22]"))?;
 
+    parse_it_issue_array(it_issue, base_url)
+}
+
+/// Parses a `google.devtools.issuetracker.v1.Issue` JSPB array into an `IssueBundle`
+/// and custom field definition map.
+pub fn parse_it_issue_array(
+    it_issue: &[Value],
+    base_url: &str,
+) -> Result<(IssueBundle, HashMap<i64, (String, String)>)> {
     let issue_id = it_issue
         .get(1)
         .and_then(as_i64)
@@ -466,6 +475,55 @@ pub fn parse_issue_fetch_response(
     };
 
     Ok((bundle, custom_field_defs))
+}
+
+/// Parses `b.IssueSearchResponse` from `POST /action/issues/list`.
+pub fn parse_issue_search_response(
+    root: &Value,
+    query: &str,
+    sort_by: &str,
+    base_url: &str,
+) -> Result<SearchIssuesResult> {
+    let envelope = unwrap_named_envelope(root, "b.IssueSearchResponse")?;
+    // `model.proto`: `google.devtools.issuetracker.v1.ListIssuesResponse it = 6` -> index 6 in named JSPB
+    let it_resp = envelope.get(6).and_then(Value::as_array);
+
+    let mut issues = Vec::new();
+    let mut next_page_token = None;
+    let mut total_size = 0usize;
+    let mut total_size_accurate = false;
+
+    if let Some(it) = it_resp {
+        if let Some(raw_issues) = it.first().and_then(Value::as_array) {
+            for item in raw_issues {
+                if let Some(it_issue) = item.as_array() {
+                    if let Ok((bundle, _)) = parse_it_issue_array(it_issue, base_url) {
+                        issues.push(bundle);
+                    }
+                }
+            }
+        }
+        next_page_token = it
+            .get(1)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned);
+        total_size = it
+            .get(2)
+            .and_then(as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(issues.len());
+        total_size_accurate = it.get(3).and_then(Value::as_bool).unwrap_or(false);
+    }
+
+    Ok(SearchIssuesResult {
+        query: query.to_string(),
+        sort_by: sort_by.to_string(),
+        total_size,
+        total_size_accurate,
+        next_page_token,
+        issues,
+    })
 }
 
 fn map_custom_field_field_type_from_arr(def_arr: &[Value]) -> String {

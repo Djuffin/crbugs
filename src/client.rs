@@ -6,9 +6,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::jspb::{
-    parse_component_response, parse_issue_fetch_response, parse_updates_response, parse_xssi_json,
+    parse_component_response, parse_issue_fetch_response, parse_issue_search_response,
+    parse_updates_response, parse_xssi_json,
 };
-use crate::models::IssueBundle;
+use crate::models::{IssueBundle, SearchIssuesResult};
 
 #[derive(Clone)]
 pub struct CrbugClient {
@@ -51,6 +52,78 @@ impl CrbugClient {
         } else {
             req
         }
+    }
+
+    /// Searches issues using `POST /action/issues/list` (`b.IssueSearchResponse`).
+    pub fn search_issues(
+        &self,
+        query: &str,
+        sort_by: &str,
+        limit: usize,
+    ) -> Result<SearchIssuesResult> {
+        let url = format!("{}/action/issues/list", self.base_url);
+        let target_limit = limit.max(1);
+        let mut all_issues = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut total_size = 0usize;
+        let mut total_size_accurate = false;
+
+        loop {
+            let remaining = target_limit.saturating_sub(all_issues.len());
+            if remaining == 0 {
+                break;
+            }
+            let page_size = remaining.clamp(1, 500) as i32;
+
+            // JSPB serialization of IssueListRequest:
+            // [null, null, null, null, null, tracker_ids (6), ListIssuesRequest (7)]
+            // ListIssuesRequest: [query (1), order_by (2), page_size (3), page_token (4)]
+            let it_req = match page_token.as_deref() {
+                Some(tok) if !tok.is_empty() => json!([query, sort_by, page_size, tok]),
+                _ => json!([query, sort_by, page_size]),
+            };
+            let body = json!([null, null, null, null, null, null, it_req]).to_string();
+
+            let req = self
+                .apply_common_headers(self.agent.post(&url))
+                .set("Content-Type", "application/json");
+            let (status, text) = send_string_and_read_text(req, &body, &url)?;
+
+            let val = parse_xssi_json(&text).map_err(|e| {
+                anyhow!(
+                    "Failed to search issues for query '{}' (HTTP {}): {} ({})",
+                    query,
+                    status,
+                    e,
+                    text.chars().take(300).collect::<String>()
+                )
+            })?;
+
+            let page = parse_issue_search_response(&val, query, sort_by, &self.base_url)?;
+            total_size = page.total_size;
+            total_size_accurate = page.total_size_accurate;
+            let fetched_count = page.issues.len();
+            all_issues.extend(page.issues);
+            page_token = page.next_page_token;
+
+            if fetched_count == 0 || page_token.is_none() || all_issues.len() >= target_limit {
+                break;
+            }
+        }
+
+        all_issues.truncate(target_limit);
+        if total_size < all_issues.len() {
+            total_size = all_issues.len();
+        }
+
+        Ok(SearchIssuesResult {
+            query: query.to_string(),
+            sort_by: sort_by.to_string(),
+            total_size,
+            total_size_accurate,
+            next_page_token: page_token,
+            issues: all_issues,
+        })
     }
 
     /// Fetches the complete `IssueBundle` (issue state, custom fields, component hierarchy,

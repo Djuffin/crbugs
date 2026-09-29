@@ -135,3 +135,48 @@ fn test_cli_end_to_end_563075803() {
     assert!(content.contains("# [Issue 563075803]"));
     assert!(att_dir.join("82130204_analyze.py").exists());
 }
+
+#[test]
+fn test_search_issues_by_user_and_status() {
+    let tmp = tempdir().expect("Failed to create temp dir");
+
+    // 1. Search issues assigned to eugene@chromium.org with status:fixed
+    let fixed_out = tmp.path().join("fixed.md");
+    let cli_fixed = Cli::parse_from([
+        "crbugs",
+        "--assignee",
+        "eugene@chromium.org",
+        "--status",
+        "fixed",
+        "--limit",
+        "10",
+        "-o",
+        fixed_out.to_str().unwrap(),
+        "--quiet",
+    ]);
+    crbugs::run(cli_fixed).expect("Search fixed issues failed");
+    let fixed_md = std::fs::read_to_string(&fixed_out).unwrap();
+    assert!(fixed_md.contains("assignee:eugene@chromium.org status:FIXED"));
+    assert!(fixed_md.contains("`FIXED`"));
+    assert!(!fixed_md.contains("`ASSIGNED`"));
+
+    // 2. Search issues assigned to eugene@chromium.org with status:assigned using positional email
+    let assigned_out = tmp.path().join("assigned.md");
+    let cli_assigned = Cli::parse_from([
+        "crbugs",
+        "eugene@chromium.org",
+        "-s",
+        "assigned",
+        "-l",
+        "10",
+        "-o",
+        assigned_out.to_str().unwrap(),
+        "--quiet",
+    ]);
+    crbugs::run(cli_assigned).expect("Search assigned issues failed");
+    let assigned_md = std::fs::read_to_string(&assigned_out).unwrap();
+    assert!(assigned_md.contains("assignee:eugene@chromium.org status:ASSIGNED"));
+    assert!(assigned_md.contains("`ASSIGNED`"));
+    assert!(!assigned_md.contains("`FIXED`"));
+}
+

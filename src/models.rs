@@ -119,3 +119,15 @@ pub struct FieldDiff {
     pub field: String,
     pub summary: String,
 }
+
+/// Paginated or bounded search results from `POST /action/issues/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIssuesResult {
+    pub query: String,
+    pub sort_by: String,
+    pub total_size: usize,
+    pub total_size_accurate: bool,
+    pub next_page_token: Option<String>,
+    pub issues: Vec<IssueBundle>,
+}
+
