@@ -41,7 +41,7 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         };
 
-        if let Some(ref path) = cli.resolved_search_output_path() {
+        if let Some(ref path) = cli.resolved_output_path() {
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent).with_context(|| {
@@ -83,10 +83,10 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut bundle =
         client.fetch_issue_bundle(issue_id, cli.include_field_updates, cli.max_comments)?;
 
-    let output_path = cli.resolved_output_path(issue_id);
-    let attachments_dir = cli.resolved_attachments_dir(issue_id);
+    let output_path = cli.resolved_output_path();
 
-    if !cli.skip_attachments && !bundle.attachments.is_empty() {
+    if cli.should_download_attachments() && !bundle.attachments.is_empty() {
+        let attachments_dir = cli.resolved_attachments_dir(issue_id);
         if !cli.quiet {
             eprintln!(
                 "Downloading {} attachment(s) to {}...",

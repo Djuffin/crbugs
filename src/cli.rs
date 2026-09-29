@@ -4,7 +4,9 @@ use regex::Regex;
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = "\
-crbugs — Fetch or search Chromium issues on https://issues.chromium.org/ and export to Markdown or JSON.
+crbugs — Fetch or search Chromium issues on https://issues.chromium.org/ in Markdown or JSON.
+
+By default, output is printed directly to stdout. Pass -o / --output <PATH> to export to a file.
 
 Features:
   • Fetch a single issue by ID or URL: title, description, status, priority, severity, type,
@@ -14,22 +16,24 @@ Features:
     (--status / -s: fixed, assigned, accepted, new, open, closed, verified, etc.), or raw query.
   • Reads the full comment thread in chronological order, coalescing attachment uploads
     with their associated comments.
-  • Downloads binary attachments concurrently with safe filename sanitization.
+  • Downloads binary attachments concurrently when exporting to a file (-o) or when
+    --attachments-dir (-a) is specified.
   • Works out-of-the-box without authentication for public Chromium issues.";
 
 const AFTER_LONG_HELP: &str = "\
 EXAMPLES:
-  1. Export an issue and all its attachments to ./crbug_563075803/:
+  1. Print an issue in Markdown to stdout (default):
      $ crbugs 563075803
 
-  2. Print Markdown to stdout without downloading binary attachments:
-     $ crbugs 563075803 --stdout --skip-attachments
-
-  3. Fetch using a full URL or crbug.com shorthand:
+  2. Fetch using a full URL or crbug.com shorthand:
      $ crbugs https://issues.chromium.org/issues/563075803
      $ crbugs https://crbug.com/563075803
 
-  4. Search for issues assigned to a user by email:
+  3. Export an issue to a Markdown file and download its attachments:
+     $ crbugs 563075803 -o ./crbug_563075803/issue.md
+     $ crbugs 563075803 -o ./bug.md -a ./bug_attachments
+
+  4. Search for issues assigned to a user by email (prints to stdout by default):
      $ crbugs --assignee eugene@chromium.org
      $ crbugs eugene@chromium.org
 
@@ -37,21 +41,15 @@ EXAMPLES:
      $ crbugs --assignee eugene@chromium.org --status fixed
      $ crbugs -u eugene@chromium.org -s assigned,accepted --limit 20
 
-  6. Emit structured JSON for an issue or search query:
-     $ crbugs 563075803 --stdout --format json --skip-attachments
+  6. Emit structured JSON to stdout:
+     $ crbugs 563075803 --format json
      $ crbugs -u eugene@chromium.org -s fixed --format json
 
   7. Limit output to the initial description plus the last 10 comments:
-     $ crbugs 563075803 --stdout --max-comments 10
+     $ crbugs 563075803 --max-comments 10
 
   8. Include field-change history (status, assignee, component, label diffs) in the timeline:
-     $ crbugs 563075803 --include-field-updates
-
-OUTPUT LAYOUT (DEFAULT SINGLE-ISSUE FILE MODE):
-  ./crbug_<ISSUE_ID>/
-  ├── issue_<ISSUE_ID>.md                  # YAML frontmatter + metadata table + description + comments
-  └── attachments/
-      └── <ATTACHMENT_ID>_<FILENAME>       # Downloaded attachments linked relatively from the .md file";
+     $ crbugs 563075803 --include-field-updates";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -65,7 +63,7 @@ pub enum OutputFormat {
 #[command(
     name = "crbugs",
     version,
-    about = "Fetch or search Chromium issues from issues.chromium.org into Markdown or JSON",
+    about = "Fetch or search Chromium issues from issues.chromium.org (prints to stdout by default)",
     long_about = LONG_ABOUT,
     after_long_help = AFTER_LONG_HELP,
     arg_required_else_help = true
@@ -120,13 +118,12 @@ pub struct Cli {
     )]
     pub sort: String,
 
-    /// Output file path (use '-' for stdout).
-    /// Single issue defaults to ./crbug_<id>/issue_<id>.md; search defaults to stdout unless -o is set
+    /// Export output to a file path instead of printing to stdout (use '-' for stdout)
     #[arg(short = 'o', long = "output", value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Print the rendered Markdown or JSON directly to stdout instead of writing a file
-    #[arg(long = "stdout")]
+    /// Print output to stdout (default when --output is not specified)
+    #[arg(long = "stdout", hide_short_help = true)]
     pub stdout: bool,
 
     /// Output format: markdown or json
@@ -140,11 +137,11 @@ pub struct Cli {
     pub format: OutputFormat,
 
     /// Directory to save downloaded attachments
-    /// [default: <output_dir>/attachments or ./crbug_<id>/attachments]
+    /// [default: <output_dir>/attachments when -o is used]
     #[arg(short = 'a', long = "attachments-dir", value_name = "DIR")]
     pub attachments_dir: Option<PathBuf>,
 
-    /// Do not download attachment binary files (attachment metadata & URLs are still included)
+    /// Do not download attachment binary files even when exporting to a file
     #[arg(long = "skip-attachments", visible_alias = "no-attachments")]
     pub skip_attachments: bool,
 
@@ -272,48 +269,31 @@ impl Cli {
         Ok(Some(parts.join(" ")))
     }
 
-    /// Returns true if the primary document should be written to stdout.
-    pub fn writes_to_stdout(&self) -> bool {
-        self.stdout
-            || self
-                .output
-                .as_ref()
-                .map(|p| p.as_os_str() == "-")
-                .unwrap_or(false)
-    }
-
-    /// Resolves the target output file path for a single issue (`None` when writing to stdout).
-    pub fn resolved_output_path(&self, issue_id: i64) -> Option<PathBuf> {
-        if self.writes_to_stdout() {
+    /// Resolves the target output file path (`None` when writing to stdout, which is the default).
+    pub fn resolved_output_path(&self) -> Option<PathBuf> {
+        if self.stdout {
             return None;
         }
-        if let Some(ref path) = self.output {
-            return Some(path.clone());
+        match self.output {
+            Some(ref path) if path.as_os_str() != "-" => Some(path.clone()),
+            _ => None,
         }
-        let ext = match self.format {
-            OutputFormat::Markdown => "md",
-            OutputFormat::Json => "json",
-        };
-        Some(
-            PathBuf::from(format!("crbug_{}", issue_id))
-                .join(format!("issue_{}.{}", issue_id, ext)),
-        )
     }
 
-    /// Resolves the target output file path for search results (`None` when writing to stdout, which is default for search).
-    pub fn resolved_search_output_path(&self) -> Option<PathBuf> {
-        if self.writes_to_stdout() {
-            return None;
-        }
-        self.output.clone()
+    /// Returns true if attachments should be downloaded to disk.
+    /// Attachments are downloaded when `--attachments-dir` (`-a`) or `--output` (`-o`) is explicitly provided,
+    /// unless `--skip-attachments` is set.
+    pub fn should_download_attachments(&self) -> bool {
+        !self.skip_attachments
+            && (self.attachments_dir.is_some() || self.resolved_output_path().is_some())
     }
 
-    /// Resolves the directory where attachments should be stored on disk.
+    /// Resolves the directory where attachments should be stored on disk when downloading is enabled.
     pub fn resolved_attachments_dir(&self, issue_id: i64) -> PathBuf {
         if let Some(ref dir) = self.attachments_dir {
             return dir.clone();
         }
-        if let Some(out_path) = self.resolved_output_path(issue_id) {
+        if let Some(out_path) = self.resolved_output_path() {
             if let Some(parent) = out_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     return parent.join("attachments");
@@ -490,5 +470,28 @@ mod tests {
         );
         assert!(build_status_filter(&["invalid_status".to_string()]).is_err());
     }
+
+    #[test]
+    fn test_default_stdout_and_explicit_file_export() {
+        let default_cli = Cli::parse_from(["crbugs", "563075803"]);
+        assert!(default_cli.resolved_output_path().is_none());
+        assert!(!default_cli.should_download_attachments());
+
+        let file_cli = Cli::parse_from(["crbugs", "563075803", "-o", "out.md"]);
+        assert_eq!(
+            file_cli.resolved_output_path().unwrap(),
+            PathBuf::from("out.md")
+        );
+        assert!(file_cli.should_download_attachments());
+
+        let file_skip_att_cli =
+            Cli::parse_from(["crbugs", "563075803", "-o", "out.md", "--skip-attachments"]);
+        assert!(!file_skip_att_cli.should_download_attachments());
+
+        let stdout_with_att_cli = Cli::parse_from(["crbugs", "563075803", "-a", "my_attachments"]);
+        assert!(stdout_with_att_cli.resolved_output_path().is_none());
+        assert!(stdout_with_att_cli.should_download_attachments());
+    }
 }
+
 

@@ -258,7 +258,7 @@ pub fn render_issue_markdown(bundle: &IssueBundle) -> String {
                         "Downloaded".to_string()
                     }
                 }
-                AttachmentDownloadStatus::Skipped => "Skipped (`--skip-attachments`)".to_string(),
+                AttachmentDownloadStatus::Skipped => "Remote URL".to_string(),
                 AttachmentDownloadStatus::SkippedTooLarge => {
                     "Skipped (exceeds `--max-attachment-size`)".to_string()
                 }
