@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::BufWriter;
@@ -7,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::cli::AuthMode;
+use crate::cli::{is_legacy_monorail_id, AuthMode};
 use crate::jspb::{
     parse_component_response, parse_issue_fetch_response, parse_issue_search_response,
     parse_updates_response, parse_xssi_json,
@@ -18,6 +19,7 @@ use crate::protojson::{
 };
 
 const CORP_API_BASE_URL: &str = "https://issuetracker.corp.googleapis.com/v1";
+const MONORAIL_REDIRECT_BASE_URL: &str = "https://bugs.chromium.org";
 const SSO_CRED_HELPER_BIN: &str = "/usr/bin/sso-cred-helper";
 const SSO_CLIENT_BIN: &str = "/usr/bin/sso_client";
 
@@ -243,14 +245,86 @@ impl CrbugClient {
         })
     }
 
+    /// Resolves a legacy Monorail issue ID (e.g. `chromium/1275474` or `v8/10000`) to its
+    /// migrated Google Issue Tracker ID via `bugs.chromium.org` (falling back to search if needed).
+    pub fn resolve_monorail_id(&self, project: &str, monorail_id: i64) -> Result<i64> {
+        let proj = if project.trim().is_empty() {
+            "chromium"
+        } else {
+            project.trim()
+        };
+        let url = format!(
+            "{}/p/{}/issues/detail?id={}",
+            MONORAIL_REDIRECT_BASE_URL,
+            url_encode_param(proj),
+            monorail_id
+        );
+
+        let req = self.agent.get(&url).set("Accept", "text/html, */*");
+        match send_and_read_text(req, &url) {
+            Ok((status, text)) => {
+                if let Some(resolved_id) = extract_migrated_issue_id(&text) {
+                    return Ok(resolved_id);
+                }
+                if status == 404 || text.contains("Page Not Found") {
+                    return Err(anyhow!(
+                        "Legacy Monorail issue {}/{} was not found on bugs.chromium.org (HTTP {})",
+                        proj,
+                        monorail_id,
+                        status
+                    ));
+                }
+            }
+            Err(_) => {
+                if Path::new(SSO_CLIENT_BIN).exists() {
+                    if let Ok(out) = Command::new(SSO_CLIENT_BIN)
+                        .arg(format!("--url={}", url))
+                        .arg("--location")
+                        .arg("--connect_timeout=15")
+                        .arg("--request_timeout=30")
+                        .output()
+                    {
+                        if out.status.success() {
+                            let text = String::from_utf8_lossy(&out.stdout);
+                            if let Some(resolved_id) = extract_migrated_issue_id(&text) {
+                                return Ok(resolved_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: search for the migration marker comment in Issue Tracker
+        let migration_query = format!("\"crbug.com/{}/{}?no_tracker_redirect=1\"", proj, monorail_id);
+        if let Ok(search_res) = self.search_issues(&migration_query, "modified_time desc", 1) {
+            if let Some(first) = search_res.issues.first() {
+                return Ok(first.issue_id);
+            }
+        }
+
+        Err(anyhow!(
+            "Failed to resolve legacy Monorail issue {}/{} to a Google Issue Tracker ID",
+            proj,
+            monorail_id
+        ))
+    }
+
     /// Fetches the complete `IssueBundle` (issue state, custom fields, component hierarchy,
     /// description, comments, and attachment metadata) for a single issue ID.
+    /// Automatically resolves legacy Monorail issue IDs (`< 10,000,000`) to their migrated Issue Tracker IDs.
     pub fn fetch_issue_bundle(
         &self,
         issue_id: i64,
         include_field_updates: bool,
         max_comments: Option<usize>,
     ) -> Result<IssueBundle> {
+        let issue_id = if is_legacy_monorail_id(issue_id) {
+            self.resolve_monorail_id("chromium", issue_id)?
+        } else {
+            issue_id
+        };
+
         if self.is_corp_authenticated() {
             return self.fetch_issue_bundle_corp(issue_id, include_field_updates, max_comments);
         }
@@ -894,5 +968,19 @@ fn send_string_and_read_text(req: ureq::Request, body: &str, url: &str) -> Resul
             Ok((code, text))
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("HTTP POST to {} failed: {}", url, t)),
+    }
+}
+
+fn extract_migrated_issue_id(html: &str) -> Option<i64> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"https://issues\.chromium\.org/(?:issues/)?(\d+)").expect("valid regex")
+    });
+    let caps = re.captures(html)?;
+    let id = caps.get(1)?.as_str().parse::<i64>().ok()?;
+    if id > 0 {
+        Some(id)
+    } else {
+        None
     }
 }

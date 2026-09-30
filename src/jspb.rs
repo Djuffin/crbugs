@@ -713,6 +713,9 @@ pub(crate) fn coalesce_issue_updates(
     let mut all_attachments: Vec<AttachmentMeta> = Vec::new();
 
     for mut entry in groups {
+        if entry.body.trim() == "[Empty comment from Monorail migration]" {
+            entry.body.clear();
+        }
         if !include_field_updates {
             entry.field_updates.clear();
         }

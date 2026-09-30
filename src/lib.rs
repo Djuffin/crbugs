@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::attachments::download_bundle_attachments;
-use crate::cli::{parse_issue_id, Cli, OutputFormat};
+use crate::cli::{parse_issue_target, Cli, OutputFormat};
 use crate::client::CrbugClient;
 use crate::markdown::{render_issue_markdown, render_search_markdown};
 use crate::models::AttachmentDownloadStatus;
@@ -70,7 +70,20 @@ pub fn run(cli: Cli) -> Result<()> {
     let raw_issue = cli.issue.as_deref().ok_or_else(|| {
         anyhow!("Missing issue identifier or search filter (try --help for usage)")
     })?;
-    let issue_id = parse_issue_id(raw_issue)?;
+    let target = parse_issue_target(raw_issue)?;
+    let issue_id = if target.is_legacy_monorail() {
+        let project = target.project.as_deref().unwrap_or("chromium");
+        let resolved_id = client.resolve_monorail_id(project, target.id)?;
+        if !cli.quiet && resolved_id != target.id {
+            eprintln!(
+                "Resolved legacy Monorail issue {}/{} -> {}",
+                project, target.id, resolved_id
+            );
+        }
+        resolved_id
+    } else {
+        target.id
+    };
 
     if !cli.quiet {
         eprintln!("Fetching issue {} ({})...", issue_id, auth_label);

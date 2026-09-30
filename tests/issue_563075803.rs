@@ -254,4 +254,34 @@ fn test_corp_authenticated_fetch_and_attachments() {
     }
 }
 
+#[test]
+fn test_legacy_monorail_issue_1275474() {
+    let client = CrbugClient::new(
+        "https://issues.chromium.org".to_string(),
+        "https://usercontent.issues.chromium.org".to_string(),
+        None,
+    )
+    .expect("Failed to create CrbugClient");
+
+    let resolved_id = client
+        .resolve_monorail_id("chromium", 1275474)
+        .expect("Failed to resolve legacy Monorail issue 1275474");
+    assert_eq!(resolved_id, 40207080);
+
+    let bundle = client
+        .fetch_issue_bundle(1275474, false, None)
+        .expect("Failed to fetch issue bundle for legacy Monorail ID 1275474");
+    assert_eq!(bundle.issue_id, 40207080);
+    assert!(bundle.title.contains("MojoVEA, VEAAdapter"));
+    assert_eq!(bundle.status, "FIXED");
+    assert!(
+        !bundle
+            .comments
+            .iter()
+            .any(|c| c.body.contains("[Empty comment from Monorail migration]")),
+        "Expected empty Monorail migration placeholder comments to be stripped"
+    );
+}
+
+
 

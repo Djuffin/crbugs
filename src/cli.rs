@@ -527,9 +527,35 @@ pub fn build_component_filter(components: &[String]) -> Result<String> {
     }
 }
 
-/// Parses an issue identifier from a raw numeric string, `b/<id>`, `crbug.com/<id>`,
+/// Maximum numeric issue ID used by legacy Monorail issues before migration to Google Issue Tracker.
+/// `crbug.com` redirects all IDs `<= 9_999_999` through `bugs.chromium.org`.
+pub const LEGACY_MONORAIL_MAX_ID: i64 = 9_999_999;
+
+/// Returns `true` if `issue_id` falls in the legacy Monorail ID range (`1..=9_999_999`).
+pub fn is_legacy_monorail_id(issue_id: i64) -> bool {
+    (1..=LEGACY_MONORAIL_MAX_ID).contains(&issue_id)
+}
+
+/// Parsed representation of an issue identifier, optionally carrying a Monorail project prefix
+/// (such as `"chromium"` or `"v8"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueTarget {
+    pub project: Option<String>,
+    pub id: i64,
+}
+
+impl IssueTarget {
+    /// Returns `true` if this target refers to a legacy Monorail issue that must be resolved
+    /// to a Google Issue Tracker ID before fetching.
+    pub fn is_legacy_monorail(&self) -> bool {
+        self.project.is_some() || is_legacy_monorail_id(self.id)
+    }
+}
+
+/// Parses an `IssueTarget` (optional Monorail project name + numeric ID) from a raw numeric string,
+/// `b/<id>`, `<project>/<id>`, `crbug.com/[<project>/]<id>`, `bugs.chromium.org/p/<project>/issues/detail?id=<id>`,
 /// or `https://issues.chromium.org/issues/<id>` URL.
-pub fn parse_issue_id(input: &str) -> Result<i64> {
+pub fn parse_issue_target(input: &str) -> Result<IssueTarget> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("Issue identifier cannot be empty"));
@@ -537,15 +563,49 @@ pub fn parse_issue_id(input: &str) -> Result<i64> {
 
     if let Ok(id) = trimmed.parse::<i64>() {
         if id > 0 {
-            return Ok(id);
+            return Ok(IssueTarget { project: None, id });
         }
     }
 
-    static PATTERNS: std::sync::OnceLock<[Regex; 4]> = std::sync::OnceLock::new();
+    static BUGS_CHROMIUM_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let bugs_re = BUGS_CHROMIUM_RE.get_or_init(|| {
+        Regex::new(r"bugs\.chromium\.org/p/([a-zA-Z0-9_-]+)/issues/detail\?(?:[^#]*&)?id=(\d+)")
+            .expect("valid regex")
+    });
+    if let Some(caps) = bugs_re.captures(trimmed) {
+        if let (Some(proj), Some(id_m)) = (caps.get(1), caps.get(2)) {
+            if let Ok(id) = id_m.as_str().parse::<i64>() {
+                if id > 0 {
+                    return Ok(IssueTarget {
+                        project: Some(proj.as_str().to_ascii_lowercase()),
+                        id,
+                    });
+                }
+            }
+        }
+    }
+
+    static CRBUG_URL_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let crbug_re = CRBUG_URL_RE.get_or_init(|| {
+        Regex::new(r"crbug\.com/(?:([a-zA-Z0-9_-]+)/)?(\d+)").expect("valid regex")
+    });
+    if let Some(caps) = crbug_re.captures(trimmed) {
+        if let Some(id_m) = caps.get(2) {
+            if let Ok(id) = id_m.as_str().parse::<i64>() {
+                if id > 0 {
+                    let project = caps
+                        .get(1)
+                        .map(|m| m.as_str().to_ascii_lowercase());
+                    return Ok(IssueTarget { project, id });
+                }
+            }
+        }
+    }
+
+    static PATTERNS: std::sync::OnceLock<[Regex; 3]> = std::sync::OnceLock::new();
     let regexes = PATTERNS.get_or_init(|| {
         [
-            Regex::new(r"(?:issues\.chromium\.org|issuetracker\.google\.com|b\.corp\.google\.com)/(?:u/\d+/)?issues/(\d+)").expect("valid regex"),
-            Regex::new(r"crbug\.com/(?:[a-zA-Z0-9_-]+/)?(\d+)").expect("valid regex"),
+            Regex::new(r"(?:issues\.chromium\.org|issuetracker\.google\.com|b\.corp\.google\.com)/(?:u/\d+/)?(?:issues/)?(\d+)").expect("valid regex"),
             Regex::new(r"[?&]id=(\d+)").expect("valid regex"),
             Regex::new(r"^(?:b/|b:|crbug:|issue:)(\d+)$").expect("valid regex"),
         ]
@@ -556,8 +616,28 @@ pub fn parse_issue_id(input: &str) -> Result<i64> {
             if let Some(m) = caps.get(1) {
                 if let Ok(id) = m.as_str().parse::<i64>() {
                     if id > 0 {
-                        return Ok(id);
+                        return Ok(IssueTarget { project: None, id });
                     }
+                }
+            }
+        }
+    }
+
+    static PROJECT_SHORTHAND_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let proj_re = PROJECT_SHORTHAND_RE.get_or_init(|| {
+        Regex::new(r"^(?:crbug:)?([a-zA-Z][a-zA-Z0-9_-]*)/(\d+)$").expect("valid regex")
+    });
+    if let Some(caps) = proj_re.captures(trimmed) {
+        if let (Some(proj), Some(id_m)) = (caps.get(1), caps.get(2)) {
+            if let Ok(id) = id_m.as_str().parse::<i64>() {
+                if id > 0 {
+                    let proj_lower = proj.as_str().to_ascii_lowercase();
+                    let project = if proj_lower == "b" {
+                        None
+                    } else {
+                        Some(proj_lower)
+                    };
+                    return Ok(IssueTarget { project, id });
                 }
             }
         }
@@ -567,6 +647,12 @@ pub fn parse_issue_id(input: &str) -> Result<i64> {
         "Could not parse a valid numeric issue ID from '{}'. Expected an ID like '563075803' or URL like 'https://issues.chromium.org/issues/563075803'.",
         input
     ))
+}
+
+/// Parses an issue identifier from a raw numeric string, `b/<id>`, `crbug.com/<id>`,
+/// or `https://issues.chromium.org/issues/<id>` URL.
+pub fn parse_issue_id(input: &str) -> Result<i64> {
+    parse_issue_target(input).map(|t| t.id)
 }
 
 #[cfg(test)]
@@ -579,6 +665,10 @@ mod tests {
         assert_eq!(
             parse_issue_id("https://issues.chromium.org/issues/563075803").unwrap(),
             563075803
+        );
+        assert_eq!(
+            parse_issue_id("https://issues.chromium.org/40207080").unwrap(),
+            40207080
         );
         assert_eq!(
             parse_issue_id("https://issues.chromium.org/u/0/issues/563075803#comment2").unwrap(),
@@ -594,6 +684,32 @@ mod tests {
         );
         assert_eq!(parse_issue_id("b/563075803").unwrap(), 563075803);
         assert!(parse_issue_id("not-an-id").is_err());
+
+        let legacy = parse_issue_target("1275474").unwrap();
+        assert_eq!(legacy, IssueTarget { project: None, id: 1275474 });
+        assert!(legacy.is_legacy_monorail());
+
+        let v8_target = parse_issue_target("crbug.com/v8/10000").unwrap();
+        assert_eq!(
+            v8_target,
+            IssueTarget {
+                project: Some("v8".to_string()),
+                id: 10000
+            }
+        );
+        assert!(v8_target.is_legacy_monorail());
+
+        let bugs_url =
+            parse_issue_target("https://bugs.chromium.org/p/chromium/issues/detail?id=1275474")
+                .unwrap();
+        assert_eq!(
+            bugs_url,
+            IssueTarget {
+                project: Some("chromium".to_string()),
+                id: 1275474
+            }
+        );
+        assert!(bugs_url.is_legacy_monorail());
     }
 
     #[test]
