@@ -9,7 +9,7 @@
 
   ### 2. Single Issue Fetch (Markdown, JSON, Timeline Flags)
   Using public issue 563075803:
-  - Markdown (default): Contains YAML frontmatter (issue_id: 563075803), # [Issue 563075803], ## Metadata, ## Description, ## Attachments, and ## Comments.
+  - Markdown (default): Clean Markdown starting with # [Issue 563075803], followed by ## Metadata, ## Description, ## Attachments, and ## Comments.
   - JSON (--format json): Parses cleanly with jq and has expected fields (issue_id == 563075803, .comments | length > 0, .attachments | length > 0).
   - Comment limit (--max-comments 2 --format json): .comments | length == 2.
   - Field updates (--include-field-updates): Output includes **Field Updates:** entries in the comment timeline.
@@ -48,8 +48,8 @@
     echo "=== 1. Smoke & ID Parsing ==="
     "$CRBUGS" --version
     "$CRBUGS" --help >/dev/null
-    "$CRBUGS" "563075803" --no-auth -q | grep -m1 -q "^issue_id: 563075803$"
-    "$CRBUGS" "1275474" --no-auth -q --max-comments 3 | grep -m1 -q "^issue_id: 40207080$"
+    "$CRBUGS" "563075803" --no-auth -q | grep -m1 -q "^# \[Issue 563075803\]"
+    "$CRBUGS" "1275474" --no-auth -q --max-comments 3 | grep -m1 -q "^# \[Issue 40207080\]"
     ! "$CRBUGS" "b/563075803" --no-auth >/dev/null 2>&1
     ! "$CRBUGS" "https://crbug.com/563075803" --no-auth >/dev/null 2>&1
     ! "$CRBUGS" 1275474 --no-auth -q | grep -q "Empty comment from Monorail migration"

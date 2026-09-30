@@ -16,63 +16,7 @@ pub fn render_issue_markdown(bundle: &IssueBundle) -> String {
         bundle.component_path.join(" > ")
     };
 
-    // 1. YAML Frontmatter
-    let _ = writeln!(out, "---");
-    let _ = writeln!(out, "issue_id: {}", bundle.issue_id);
-    let _ = writeln!(out, "url: {}", yaml_quote(&bundle.url));
-    let _ = writeln!(out, "title: {}", yaml_quote(&bundle.title));
-    let _ = writeln!(out, "type: {}", bundle.issue_type);
-    let _ = writeln!(out, "status: {}", bundle.status);
-    let _ = writeln!(out, "priority: {}", bundle.priority);
-    let _ = writeln!(out, "severity: {}", bundle.severity);
-    let _ = writeln!(out, "component_id: {}", bundle.component_id);
-    let _ = writeln!(out, "component: {}", yaml_quote(&component_display));
-    if let Some(ref rep) = bundle.reporter {
-        let _ = writeln!(out, "reporter: {}", yaml_quote(rep));
-    } else {
-        let _ = writeln!(out, "reporter: null");
-    }
-    if let Some(ref asg) = bundle.assignee {
-        let _ = writeln!(out, "assignee: {}", yaml_quote(asg));
-    } else {
-        let _ = writeln!(out, "assignee: null");
-    }
-    if let Some(ref ver) = bundle.verifier {
-        let _ = writeln!(out, "verifier: {}", yaml_quote(ver));
-    }
-    if let Some(t) = bundle.created_time {
-        let _ = writeln!(out, "created_time: \"{}\"", t.to_rfc3339());
-    }
-    if let Some(t) = bundle.modified_time {
-        let _ = writeln!(out, "modified_time: \"{}\"", t.to_rfc3339());
-    }
-    if let Some(t) = bundle.resolved_time {
-        let _ = writeln!(out, "resolved_time: \"{}\"", t.to_rfc3339());
-    }
-    if let Some(t) = bundle.verified_time {
-        let _ = writeln!(out, "verified_time: \"{}\"", t.to_rfc3339());
-    }
-    if !bundle.pending_code_changes.is_empty() {
-        let _ = writeln!(out, "pending_code_changes:");
-        for c in &bundle.pending_code_changes {
-            let _ = writeln!(out, "  - {}", yaml_quote(&c.url));
-        }
-    }
-    if !bundle.code_changes.is_empty() {
-        let _ = writeln!(out, "code_changes:");
-        for c in &bundle.code_changes {
-            let _ = writeln!(out, "  - {}", yaml_quote(&c.url));
-        }
-    }
-    if !bundle.custom_fields.is_empty() {
-        let _ = writeln!(out, "custom_fields:");
-        for cf in &bundle.custom_fields {
-            let _ = writeln!(out, "  {}: {}", yaml_key(&cf.name), yaml_quote(&cf.value));
-        }
-    }
-    let _ = writeln!(out, "---\n");
-
-    // 2. Title
+    // 1. Title
     let _ = writeln!(
         out,
         "# [Issue {}]({}): {}\n",
@@ -411,20 +355,6 @@ fn format_code_change_links(changes: &[CodeChange]) -> String {
         .map(|c| format!("[{}]({})", c.change_number, c.url))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-fn yaml_quote(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{}\"", s.replace('"', "\\\"")))
-}
-
-fn yaml_key(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        s.to_string()
-    } else {
-        yaml_quote(s)
-    }
 }
 
 fn escape_table_cell(s: &str) -> String {

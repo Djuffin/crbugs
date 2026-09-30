@@ -53,14 +53,7 @@ fn test_code_changes_and_pending_code_changes_327625558() {
 
     // 3. Verify Markdown rendering
     let md = render_issue_markdown(&bundle);
-    assert!(
-        md.contains("pending_code_changes:"),
-        "Expected pending_code_changes in YAML frontmatter"
-    );
-    assert!(
-        md.contains("code_changes:"),
-        "Expected code_changes in YAML frontmatter"
-    );
+    assert!(!md.starts_with("---"));
     assert!(
         md.contains("| **Pending Code Changes** |"),
         "Expected Pending Code Changes row in metadata table"

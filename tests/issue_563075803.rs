@@ -100,7 +100,8 @@ fn test_fetch_and_export_issue_563075803() {
     // 5. Verify Markdown Export
     let md = render_issue_markdown(&bundle);
     std::fs::write(&md_path, &md).expect("Failed to write markdown");
-    assert!(md.contains("issue_id: 563075803"));
+    assert!(!md.starts_with("---"));
+    assert!(md.contains("# [Issue 563075803]"));
     assert!(md.contains("HEVC hardware decode"));
     assert!(md.contains("## Metadata"));
     assert!(md.contains("## Attachments"));

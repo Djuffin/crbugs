@@ -95,7 +95,7 @@ EXAMPLES:
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
-    /// Self-contained Markdown with YAML frontmatter, metadata table, and comment thread
+    /// Self-contained Markdown with metadata table and comment thread
     Markdown,
     /// Structured JSON representation of the issue bundle or search results
     Json,
