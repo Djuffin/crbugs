@@ -2,8 +2,8 @@ use std::fmt::Write;
 
 use crate::attachments::format_byte_size;
 use crate::models::{
-    AttachmentDownloadStatus, AttachmentMeta, CommentEntry, FormattingMode, IssueBundle,
-    SearchIssuesResult,
+    AttachmentDownloadStatus, AttachmentMeta, CodeChange, CommentEntry, FormattingMode,
+    IssueBundle, SearchIssuesResult,
 };
 
 /// Renders an `IssueBundle` into a complete Markdown document.
@@ -51,6 +51,18 @@ pub fn render_issue_markdown(bundle: &IssueBundle) -> String {
     }
     if let Some(t) = bundle.verified_time {
         let _ = writeln!(out, "verified_time: \"{}\"", t.to_rfc3339());
+    }
+    if !bundle.pending_code_changes.is_empty() {
+        let _ = writeln!(out, "pending_code_changes:");
+        for c in &bundle.pending_code_changes {
+            let _ = writeln!(out, "  - {}", yaml_quote(&c.url));
+        }
+    }
+    if !bundle.code_changes.is_empty() {
+        let _ = writeln!(out, "code_changes:");
+        for c in &bundle.code_changes {
+            let _ = writeln!(out, "  - {}", yaml_quote(&c.url));
+        }
     }
     if !bundle.custom_fields.is_empty() {
         let _ = writeln!(out, "custom_fields:");
@@ -233,6 +245,14 @@ pub fn render_issue_markdown(bundle: &IssueBundle) -> String {
             escape_table_cell(&cf.value)
         );
     }
+    if !bundle.pending_code_changes.is_empty() {
+        let links = format_code_change_links(&bundle.pending_code_changes);
+        let _ = writeln!(out, "| **Pending Code Changes** | {} |", links);
+    }
+    if !bundle.code_changes.is_empty() {
+        let links = format_code_change_links(&bundle.code_changes);
+        let _ = writeln!(out, "| **Code Changes** | {} |", links);
+    }
     let _ = writeln!(out);
 
     // 4. Top-level Attachments Summary Table (if any)
@@ -381,6 +401,14 @@ fn render_attachment_item(out: &mut String, att: &AttachmentMeta) {
 fn format_issue_links(ids: &[i64], base_url: &str) -> String {
     ids.iter()
         .map(|id| format!("[{}]({}/issues/{})", id, base_url, id))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_code_change_links(changes: &[CodeChange]) -> String {
+    changes
+        .iter()
+        .map(|c| format!("[{}]({})", c.change_number, c.url))
         .collect::<Vec<_>>()
         .join(", ")
 }

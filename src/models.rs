@@ -37,10 +37,24 @@ pub struct IssueBundle {
     pub in_prod: bool,
     pub is_archived: bool,
     pub access_level: String,
+    pub pending_code_changes: Vec<CodeChange>,
+    pub code_changes: Vec<CodeChange>,
     pub custom_fields: Vec<ResolvedCustomField>,
     pub description: Option<CommentEntry>,
     pub comments: Vec<CommentEntry>,
     pub attachments: Vec<AttachmentMeta>,
+}
+
+/// A Gerrit code change associated with an issue (`Pending Code Changes` or `Code Changes`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeChange {
+    pub host: String,
+    pub repo: String,
+    pub change_number: i64,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub url: String,
 }
 
 /// Custom field definition joined with its current value on the issue.

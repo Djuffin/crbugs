@@ -4,8 +4,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::models::{
-    AttachmentDownloadStatus, AttachmentMeta, CommentEntry, CustomFieldDefMap, FieldDiff,
-    FormattingMode, IssueBundle, ResolvedCustomField, SearchIssuesResult,
+    AttachmentDownloadStatus, AttachmentMeta, CodeChange, CommentEntry, CustomFieldDefMap,
+    FieldDiff, FormattingMode, IssueBundle, ResolvedCustomField, SearchIssuesResult,
 };
 
 pub(crate) const GROUPING_WINDOW_SECS: i64 = 3600;
@@ -373,6 +373,7 @@ pub fn parse_it_issue_array(
     let duplicate_issue_ids = parse_i64_list(state.get(21));
     let collaborators = parse_user_list(state.get(30));
     let access_level = map_access_level(state.get(31));
+    let (pending_code_changes, code_changes) = parse_gerrit_changes_list(state.get(34));
 
     let created_time = parse_timestamp(it_issue.get(4));
     let modified_time = parse_timestamp(it_issue.get(5));
@@ -462,6 +463,8 @@ pub fn parse_it_issue_array(
         in_prod,
         is_archived,
         access_level,
+        pending_code_changes,
+        code_changes,
         custom_fields,
         description: fallback_description,
         comments: Vec::new(),
@@ -469,6 +472,72 @@ pub fn parse_it_issue_array(
     };
 
     Ok((bundle, custom_field_defs))
+}
+
+pub(crate) fn map_gerrit_state(code: i64) -> String {
+    match code {
+        1 => "PENDING".to_string(),
+        2 => "MERGED".to_string(),
+        _ => "STATE_UNSPECIFIED".to_string(),
+    }
+}
+
+pub(crate) fn format_gerrit_url(host: &str, repo: &str, change_number: i64) -> String {
+    if repo.is_empty() {
+        format!("https://{}-review.googlesource.com/{}", host, change_number)
+    } else {
+        format!(
+            "https://{}-review.googlesource.com/c/{}/+/{}",
+            host, repo, change_number
+        )
+    }
+}
+
+pub(crate) fn parse_gerrit_change_array(arr: &[Value]) -> Option<CodeChange> {
+    let host = arr.first()?.as_str()?.trim().to_string();
+    let repo = arr
+        .get(1)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let change_number = arr.get(2).and_then(as_i64)?;
+    let state = map_gerrit_state(arr.get(3).and_then(as_i64).unwrap_or(0));
+    let branch = arr
+        .get(4)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let url = format_gerrit_url(&host, &repo, change_number);
+
+    Some(CodeChange {
+        host,
+        repo,
+        change_number,
+        state,
+        branch,
+        url,
+    })
+}
+
+fn parse_gerrit_changes_list(v: Option<&Value>) -> (Vec<CodeChange>, Vec<CodeChange>) {
+    let mut pending = Vec::new();
+    let mut merged = Vec::new();
+    if let Some(arr) = v.and_then(Value::as_array) {
+        for item in arr {
+            if let Some(item_arr) = item.as_array() {
+                if let Some(gc) = parse_gerrit_change_array(item_arr) {
+                    if gc.state == "PENDING" {
+                        pending.push(gc);
+                    } else {
+                        merged.push(gc);
+                    }
+                }
+            }
+        }
+    }
+    (pending, merged)
 }
 
 pub(crate) fn resolve_custom_fields(
@@ -1037,6 +1106,11 @@ fn format_proto_any(any_val: Option<&Value>, field_name: &str) -> Option<String>
     }
     if type_url.ends_with("BoolValue") {
         return payload.first()?.as_bool().map(|b| b.to_string());
+    }
+    if type_url.ends_with("GerritChange") {
+        if let Some(gc) = parse_gerrit_change_array(payload) {
+            return Some(format!("{} ({})", gc.url, gc.state));
+        }
     }
     None
 }

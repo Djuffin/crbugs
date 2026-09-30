@@ -5,11 +5,12 @@ use std::collections::HashMap;
 
 use crate::jspb::{
     as_i64, as_u64, build_attachment_meta, build_collection_diff, coalesce_issue_updates,
-    map_field_int_code, parse_i64_list, parse_string_list, resolve_custom_fields, RawIssueUpdate,
+    format_gerrit_url, map_field_int_code, parse_i64_list, parse_string_list,
+    resolve_custom_fields, RawIssueUpdate,
 };
 use crate::models::{
-    AttachmentMeta, CommentEntry, CustomFieldDefMap, FieldDiff, FormattingMode, IssueBundle,
-    SearchIssuesResult,
+    AttachmentMeta, CodeChange, CommentEntry, CustomFieldDefMap, FieldDiff, FormattingMode,
+    IssueBundle, SearchIssuesResult,
 };
 
 fn parse_rfc3339(v: Option<&Value>) -> Option<DateTime<Utc>> {
@@ -257,6 +258,9 @@ pub fn parse_v1_issue(
             ))
         });
 
+    let (pending_code_changes, code_changes) =
+        parse_v1_gerrit_changes_list(state.get("gerritChanges"));
+
     let url = format!("{}/issues/{}", web_base_url.trim_end_matches('/'), issue_id);
 
     let bundle = IssueBundle {
@@ -292,6 +296,8 @@ pub fn parse_v1_issue(
         in_prod,
         is_archived,
         access_level,
+        pending_code_changes,
+        code_changes,
         custom_fields,
         description: fallback_description,
         comments: Vec::new(),
@@ -299,6 +305,60 @@ pub fn parse_v1_issue(
     };
 
     Ok((bundle, custom_field_defs))
+}
+
+fn parse_v1_gerrit_change(obj: &serde_json::Map<String, Value>) -> Option<CodeChange> {
+    let host = obj.get("host").and_then(Value::as_str)?.trim().to_string();
+    let repo = obj
+        .get("repo")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let change_number = obj.get("changeNumber").and_then(as_i64)?;
+    let state = match obj.get("state") {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(v) => match as_i64(v) {
+            Some(1) => "PENDING".to_string(),
+            Some(2) => "MERGED".to_string(),
+            _ => "STATE_UNSPECIFIED".to_string(),
+        },
+        None => "STATE_UNSPECIFIED".to_string(),
+    };
+    let branch = obj
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let url = format_gerrit_url(&host, &repo, change_number);
+    Some(CodeChange {
+        host,
+        repo,
+        change_number,
+        state,
+        branch,
+        url,
+    })
+}
+
+fn parse_v1_gerrit_changes_list(v: Option<&Value>) -> (Vec<CodeChange>, Vec<CodeChange>) {
+    let mut pending = Vec::new();
+    let mut merged = Vec::new();
+    if let Some(arr) = v.and_then(Value::as_array) {
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                if let Some(gc) = parse_v1_gerrit_change(obj) {
+                    if gc.state == "PENDING" {
+                        pending.push(gc);
+                    } else {
+                        merged.push(gc);
+                    }
+                }
+            }
+        }
+    }
+    (pending, merged)
 }
 
 fn parse_v1_comment_obj(
@@ -602,6 +662,11 @@ fn format_v1_any(v: Option<&Value>, field_name: &str) -> Option<String> {
         }
         if let Some(b) = val.as_bool() {
             return Some(b.to_string());
+        }
+    }
+    if obj.contains_key("changeNumber") {
+        if let Some(gc) = parse_v1_gerrit_change(obj) {
+            return Some(format!("{} ({})", gc.url, gc.state));
         }
     }
     None

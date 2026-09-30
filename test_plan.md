@@ -61,6 +61,12 @@
       | jq -e '.issue_id == 563075803 and (.comments | length == 2) and (.attachments | length == 3)' >/dev/null
     test -z "$("$CRBUGS" 563075803 --no-auth -q 2>&1 >/dev/null)"
 
+    echo "=== 2b. Pending Code Changes & Code Changes ==="
+    "$CRBUGS" 327625558 --no-auth -q --format json --max-comments 1 \
+      | jq -e '.issue_id == 327625558 and (.pending_code_changes | length == 3) and (.code_changes | length >= 17)' >/dev/null
+    "$CRBUGS" 327625558 --no-auth -q --max-comments 1 | grep -q "Pending Code Changes"
+    "$CRBUGS" 327625558 --no-auth -q --max-comments 1 | grep -q "https://chromium-review.googlesource.com/c/chromium/src/+/5855319"
+
     echo "=== 3. Search & Filters ==="
     "$CRBUGS" -u eugene@chromium.org -s fixed -l 3 --no-auth -q | grep -q "status:FIXED"
     "$CRBUGS" -c "Blink>Media>WebCodecs" -s open -l 2 --no-auth -q --format json \
