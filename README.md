@@ -4,7 +4,7 @@ A fast CLI utility to fetch and search Chromium issues (`issues.chromium.org`) a
 
 ## Features
 
-- **Single Issue Fetch**: Fetch by Buganizer ID (`563075803`, `b/563075803`), legacy Monorail ID (`1275474`, `crbug.com/chromium/1275474`), or full URL (`https://crbug.com/...`, `https://issues.chromium.org/issues/...`).
+- **Single Issue Fetch**: Fetch by Buganizer ID (`563075803`) or legacy Monorail ID (`1275474`).
 - **Issue Search**: Search by assignee (`-u`), reporter (`--reporter`), CC (`--cc`), Chromium component (`-c`), status (`-s`), or raw Issue Tracker query (`-Q`).
 - **Markdown & JSON Output**: Prints clean Markdown (with YAML frontmatter, metadata table, and chronological comments) or structured JSON (`-f json`) to stdout or a file (`-o`).
 - **Attachment Downloads**: Automatically downloads binary attachments concurrently when exporting to a file (`-o`) or when `--attachments-dir` (`-a`) is specified.

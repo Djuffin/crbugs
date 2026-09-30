@@ -3,9 +3,9 @@
   Verify basic flags, exit codes, and issue identifier formats:
 
   - crbugs --version and crbugs --help exit 0.
-  - Numeric ID (563075803), https://crbug.com/563075803, https://issues.chromium.org/issues/563075803, and b/563075803 all resolve to issue_id: 563075803.
-  - Legacy Monorail ID (1275474), https://crbug.com/1275474, crbug.com/chromium/1275474, and https://bugs.chromium.org/p/chromium/issues/detail?id=1275474 all resolve to migrated issue_id: 40207080 and strip `[Empty comment from Monorail migration]` placeholders.
-  - Running crbugs with no arguments or a nonexistent issue (999999999999) exits non-zero with a clear error message.
+  - Numeric ID (563075803) resolves to issue_id: 563075803.
+  - Legacy Monorail ID (1275474) resolves to migrated issue_id: 40207080 and strips `[Empty comment from Monorail migration]` placeholders.
+  - Running crbugs with no arguments, a non-numeric prefix/URL (b/563075803, https://crbug.com/563075803), or a nonexistent issue (999999999999) exits non-zero with a clear error message.
 
   ### 2. Single Issue Fetch (Markdown, JSON, Timeline Flags)
   Using public issue 563075803:
@@ -48,12 +48,10 @@
     echo "=== 1. Smoke & ID Parsing ==="
     "$CRBUGS" --version
     "$CRBUGS" --help >/dev/null
-    for id in "563075803" "https://crbug.com/563075803" "b/563075803"; do
-      "$CRBUGS" "$id" --no-auth -q | grep -m1 -q "^issue_id: 563075803$"
-    done
-    for legacy_id in "1275474" "https://crbug.com/1275474" "crbug.com/chromium/1275474" "https://bugs.chromium.org/p/chromium/issues/detail?id=1275474"; do
-      "$CRBUGS" "$legacy_id" --no-auth -q --max-comments 3 | grep -m1 -q "^issue_id: 40207080$"
-    done
+    "$CRBUGS" "563075803" --no-auth -q | grep -m1 -q "^issue_id: 563075803$"
+    "$CRBUGS" "1275474" --no-auth -q --max-comments 3 | grep -m1 -q "^issue_id: 40207080$"
+    ! "$CRBUGS" "b/563075803" --no-auth >/dev/null 2>&1
+    ! "$CRBUGS" "https://crbug.com/563075803" --no-auth >/dev/null 2>&1
     ! "$CRBUGS" 1275474 --no-auth -q | grep -q "Empty comment from Monorail migration"
     ! "$CRBUGS" --no-auth >/dev/null 2>&1
 

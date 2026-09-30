@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, ValueEnum};
-use regex::Regex;
 use std::path::PathBuf;
 
 const LONG_ABOUT: &str = "\
@@ -9,7 +8,7 @@ crbugs — Fetch or search Chromium issues on https://issues.chromium.org/ in Ma
 By default, output is printed directly to stdout. Pass -o / --output <PATH> to export to a file.
 
 Features:
-  • Fetch a single issue by ID or URL: title, description, status, priority, severity, type,
+  • Fetch a single issue by numeric ID: title, description, status, priority, severity, type,
     reporter, assignee, CCs, component hierarchy, hotlists, blocking/blocked-by links, and
     Chromium custom fields.
   • Search issues by assignee (--assignee / -u), reporter (--reporter), CC (--cc), component
@@ -58,43 +57,39 @@ EXAMPLES:
   1. Print an issue in Markdown to stdout (default):
      $ crbugs 563075803
 
-  2. Fetch using a full URL or crbug.com shorthand:
-     $ crbugs https://issues.chromium.org/issues/563075803
-     $ crbugs https://crbug.com/563075803
-
-  3. Export an issue to a Markdown file and download its attachments:
+  2. Export an issue to a Markdown file and download its attachments:
      $ crbugs 563075803 -o ./crbug_563075803/issue.md
      $ crbugs 563075803 -o ./bug.md -a ./bug_attachments
 
-  4. Search for issues assigned to a user by email (prints to stdout by default):
+  3. Search for issues assigned to a user by email (prints to stdout by default):
      $ crbugs --assignee eugene@chromium.org
      $ crbugs eugene@chromium.org
 
-  5. Search for issues assigned to a user filtered by status (fixed, assigned, accepted, open, etc.):
+  4. Search for issues assigned to a user filtered by status (fixed, assigned, accepted, open, etc.):
      $ crbugs --assignee eugene@chromium.org --status fixed
      $ crbugs -u eugene@chromium.org -s assigned,accepted --limit 20
 
-  6. Filter issues by Chromium component tag or numeric component ID (-c / --component):
+  5. Filter issues by Chromium component tag or numeric component ID (-c / --component):
      $ crbugs -c \"Blink>Media>WebCodecs\" -s open
      $ crbugs \"Blink>Media>WebCodecs\" -s new,assigned
      $ crbugs -c 1456526 -s open
 
-  7. Find all issues worked on or resolved in a quarter (e.g. Q3) using -Q:
+  6. Find all issues worked on or resolved in a quarter (e.g. Q3) using -Q:
      $ crbugs -u eugene@chromium.org -Q \"modified:2026-07-01..2026-09-30\" -l 100
      $ crbugs -u eugene@chromium.org -s fixed,verified -Q \"resolved:2026-07-01..2026-09-30\" -l 100
      $ crbugs -Q \"(assignee:eugene@chromium.org OR commentby:eugene@chromium.org) modified:2026-07-01..2026-09-30\" -l 200
 
-  8. Emit structured JSON to stdout:
+  7. Emit structured JSON to stdout:
      $ crbugs 563075803 --format json
      $ crbugs -u eugene@chromium.org -s fixed --format json
 
-  9. Limit output to the initial description plus the last 10 comments:
+  8. Limit output to the initial description plus the last 10 comments:
      $ crbugs 563075803 --max-comments 10
 
-  10. Include field-change history (status, assignee, component, label diffs) in the timeline:
-      $ crbugs 563075803 --include-field-updates
+  9. Include field-change history (status, assignee, component, label diffs) in the timeline:
+     $ crbugs 563075803 --include-field-updates
 
-  11. Force corp authentication (via gcert) or public unauthenticated access:
+  10. Force corp authentication (via gcert) or public unauthenticated access:
       $ crbugs 556233928 --auth corp
       $ crbugs 563075803 --no-auth";
 
@@ -126,8 +121,8 @@ pub enum AuthMode {
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// Issue identifier (e.g. 563075803, https://crbug.com/563075803, b/563075803),
-    /// user email (e.g. eugene@chromium.org), or Chromium component path (e.g. Blink>Media>WebCodecs)
+    /// Issue number (e.g. 563075803), user email (e.g. eugene@chromium.org),
+    /// or Chromium component path (e.g. Blink>Media>WebCodecs)
     #[arg(value_name = "ISSUE_OR_USER")]
     pub issue: Option<String>,
 
@@ -552,9 +547,7 @@ impl IssueTarget {
     }
 }
 
-/// Parses an `IssueTarget` (optional Monorail project name + numeric ID) from a raw numeric string,
-/// `b/<id>`, `<project>/<id>`, `crbug.com/[<project>/]<id>`, `bugs.chromium.org/p/<project>/issues/detail?id=<id>`,
-/// or `https://issues.chromium.org/issues/<id>` URL.
+/// Parses an `IssueTarget` from a raw numeric issue ID string (e.g. `563075803` or `1275474`).
 pub fn parse_issue_target(input: &str) -> Result<IssueTarget> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -567,90 +560,13 @@ pub fn parse_issue_target(input: &str) -> Result<IssueTarget> {
         }
     }
 
-    static BUGS_CHROMIUM_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let bugs_re = BUGS_CHROMIUM_RE.get_or_init(|| {
-        Regex::new(r"bugs\.chromium\.org/p/([a-zA-Z0-9_-]+)/issues/detail\?(?:[^#]*&)?id=(\d+)")
-            .expect("valid regex")
-    });
-    if let Some(caps) = bugs_re.captures(trimmed) {
-        if let (Some(proj), Some(id_m)) = (caps.get(1), caps.get(2)) {
-            if let Ok(id) = id_m.as_str().parse::<i64>() {
-                if id > 0 {
-                    return Ok(IssueTarget {
-                        project: Some(proj.as_str().to_ascii_lowercase()),
-                        id,
-                    });
-                }
-            }
-        }
-    }
-
-    static CRBUG_URL_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let crbug_re = CRBUG_URL_RE.get_or_init(|| {
-        Regex::new(r"crbug\.com/(?:([a-zA-Z0-9_-]+)/)?(\d+)").expect("valid regex")
-    });
-    if let Some(caps) = crbug_re.captures(trimmed) {
-        if let Some(id_m) = caps.get(2) {
-            if let Ok(id) = id_m.as_str().parse::<i64>() {
-                if id > 0 {
-                    let project = caps
-                        .get(1)
-                        .map(|m| m.as_str().to_ascii_lowercase());
-                    return Ok(IssueTarget { project, id });
-                }
-            }
-        }
-    }
-
-    static PATTERNS: std::sync::OnceLock<[Regex; 3]> = std::sync::OnceLock::new();
-    let regexes = PATTERNS.get_or_init(|| {
-        [
-            Regex::new(r"(?:issues\.chromium\.org|issuetracker\.google\.com|b\.corp\.google\.com)/(?:u/\d+/)?(?:issues/)?(\d+)").expect("valid regex"),
-            Regex::new(r"[?&]id=(\d+)").expect("valid regex"),
-            Regex::new(r"^(?:b/|b:|crbug:|issue:)(\d+)$").expect("valid regex"),
-        ]
-    });
-
-    for re in regexes {
-        if let Some(caps) = re.captures(trimmed) {
-            if let Some(m) = caps.get(1) {
-                if let Ok(id) = m.as_str().parse::<i64>() {
-                    if id > 0 {
-                        return Ok(IssueTarget { project: None, id });
-                    }
-                }
-            }
-        }
-    }
-
-    static PROJECT_SHORTHAND_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let proj_re = PROJECT_SHORTHAND_RE.get_or_init(|| {
-        Regex::new(r"^(?:crbug:)?([a-zA-Z][a-zA-Z0-9_-]*)/(\d+)$").expect("valid regex")
-    });
-    if let Some(caps) = proj_re.captures(trimmed) {
-        if let (Some(proj), Some(id_m)) = (caps.get(1), caps.get(2)) {
-            if let Ok(id) = id_m.as_str().parse::<i64>() {
-                if id > 0 {
-                    let proj_lower = proj.as_str().to_ascii_lowercase();
-                    let project = if proj_lower == "b" {
-                        None
-                    } else {
-                        Some(proj_lower)
-                    };
-                    return Ok(IssueTarget { project, id });
-                }
-            }
-        }
-    }
-
     Err(anyhow!(
-        "Could not parse a valid numeric issue ID from '{}'. Expected an ID like '563075803' or URL like 'https://issues.chromium.org/issues/563075803'.",
+        "Could not parse a valid numeric issue ID from '{}'. Expected a raw numeric ID like '563075803'.",
         input
     ))
 }
 
-/// Parses an issue identifier from a raw numeric string, `b/<id>`, `crbug.com/<id>`,
-/// or `https://issues.chromium.org/issues/<id>` URL.
+/// Parses an issue identifier from a raw numeric string (e.g. `563075803`).
 pub fn parse_issue_id(input: &str) -> Result<i64> {
     parse_issue_target(input).map(|t| t.id)
 }
@@ -662,54 +578,15 @@ mod tests {
     #[test]
     fn test_parse_issue_id() {
         assert_eq!(parse_issue_id("563075803").unwrap(), 563075803);
-        assert_eq!(
-            parse_issue_id("https://issues.chromium.org/issues/563075803").unwrap(),
-            563075803
-        );
-        assert_eq!(
-            parse_issue_id("https://issues.chromium.org/40207080").unwrap(),
-            40207080
-        );
-        assert_eq!(
-            parse_issue_id("https://issues.chromium.org/u/0/issues/563075803#comment2").unwrap(),
-            563075803
-        );
-        assert_eq!(
-            parse_issue_id("https://crbug.com/563075803").unwrap(),
-            563075803
-        );
-        assert_eq!(
-            parse_issue_id("crbug.com/chromium/563075803").unwrap(),
-            563075803
-        );
-        assert_eq!(parse_issue_id("b/563075803").unwrap(), 563075803);
+        assert!(parse_issue_id("b/563075803").is_err());
+        assert!(parse_issue_id("crbug/563075803").is_err());
+        assert!(parse_issue_id("https://crbug.com/563075803").is_err());
+        assert!(parse_issue_id("https://issues.chromium.org/issues/563075803").is_err());
         assert!(parse_issue_id("not-an-id").is_err());
 
         let legacy = parse_issue_target("1275474").unwrap();
         assert_eq!(legacy, IssueTarget { project: None, id: 1275474 });
         assert!(legacy.is_legacy_monorail());
-
-        let v8_target = parse_issue_target("crbug.com/v8/10000").unwrap();
-        assert_eq!(
-            v8_target,
-            IssueTarget {
-                project: Some("v8".to_string()),
-                id: 10000
-            }
-        );
-        assert!(v8_target.is_legacy_monorail());
-
-        let bugs_url =
-            parse_issue_target("https://bugs.chromium.org/p/chromium/issues/detail?id=1275474")
-                .unwrap();
-        assert_eq!(
-            bugs_url,
-            IssueTarget {
-                project: Some("chromium".to_string()),
-                id: 1275474
-            }
-        );
-        assert!(bugs_url.is_legacy_monorail());
     }
 
     #[test]

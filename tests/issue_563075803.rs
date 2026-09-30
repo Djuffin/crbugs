@@ -120,7 +120,7 @@ fn test_cli_end_to_end_563075803() {
 
     let cli = Cli::parse_from([
         "crbugs",
-        "https://issues.chromium.org/issues/563075803",
+        "563075803",
         "-o",
         out_file.to_str().unwrap(),
         "-a",
