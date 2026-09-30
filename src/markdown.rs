@@ -414,11 +414,7 @@ pub fn render_search_markdown(result: &SearchIssuesResult) -> String {
     let _ = writeln!(out, "# Chromium Issue Search Results\n");
     let _ = writeln!(out, "- **Query:** `{}`", result.query);
     let _ = writeln!(out, "- **Sort:** `{}`", result.sort_by);
-    let approx = if result.total_size_accurate || result.total_size <= result.issues.len() {
-        ""
-    } else {
-        "+"
-    };
+    let approx = if result.total_size_accurate { "" } else { "+" };
     let _ = writeln!(
         out,
         "- **Showing:** {} of {}{} issues\n",

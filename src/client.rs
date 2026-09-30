@@ -127,7 +127,7 @@ impl CrbugClient {
             if remaining == 0 {
                 break;
             }
-            let page_size = remaining.clamp(1, 500) as i32;
+            let page_size = remaining.clamp(1, 100) as i32;
 
             // JSPB serialization of IssueListRequest:
             // [null, null, null, null, null, tracker_ids (6), ListIssuesRequest (7)]
@@ -154,7 +154,7 @@ impl CrbugClient {
             })?;
 
             let page = parse_issue_search_response(&val, query, sort_by, &self.base_url)?;
-            total_size = page.total_size;
+            total_size = total_size.max(page.total_size);
             total_size_accurate = page.total_size_accurate;
             let fetched_count = page.issues.len();
             all_issues.extend(page.issues);
@@ -184,6 +184,8 @@ impl CrbugClient {
         sort_by: &str,
         limit: usize,
     ) -> Result<SearchIssuesResult> {
+        const SEARCH_FIELDS_MASK: &str = "issues(issueId,issueState,createdTime,modifiedTime,resolvedTime,verifiedTime,voteCount,version,parentIssueIds,isArchived,accessLimit,customFields(customFieldId,name,type)),nextPageToken,totalSize,totalSizeAccurate";
+
         let target_limit = limit.max(1);
         let mut all_issues = Vec::new();
         let mut page_token: Option<String> = None;
@@ -198,11 +200,12 @@ impl CrbugClient {
             let page_size = remaining.clamp(1, 250);
 
             let mut url = format!(
-                "{}/issues?query={}&orderBy={}&pageSize={}&view=FULL",
+                "{}/issues?query={}&orderBy={}&pageSize={}&view=BASIC&fields={}",
                 CORP_API_BASE_URL,
                 url_encode_param(query),
                 url_encode_param(sort_by),
-                page_size
+                page_size,
+                SEARCH_FIELDS_MASK
             );
             if let Some(ref tok) = page_token {
                 if !tok.is_empty() {
@@ -216,7 +219,7 @@ impl CrbugClient {
                 .with_context(|| format!("Failed corp issue search for query '{}'", query))?;
 
             let page = parse_v1_search_response(&val, query, sort_by, &self.base_url)?;
-            total_size = page.total_size;
+            total_size = total_size.max(page.total_size);
             total_size_accurate = page.total_size_accurate;
             let fetched_count = page.issues.len();
             all_issues.extend(page.issues);
@@ -856,17 +859,22 @@ fn url_encode_param(input: &str) -> String {
     encoded
 }
 
+fn read_response_text(resp: ureq::Response) -> std::io::Result<String> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut resp.into_reader(), &mut text)?;
+    Ok(text)
+}
+
 fn send_and_read_text(req: ureq::Request, url: &str) -> Result<(u16, String)> {
     match req.call() {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp
-                .into_string()
+            let text = read_response_text(resp)
                 .with_context(|| format!("Failed reading body from {}", url))?;
             Ok((status, text))
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
+            let text = read_response_text(resp).unwrap_or_default();
             Ok((code, text))
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("HTTP request to {} failed: {}", url, t)),
@@ -877,13 +885,12 @@ fn send_string_and_read_text(req: ureq::Request, body: &str, url: &str) -> Resul
     match req.send_string(body) {
         Ok(resp) => {
             let status = resp.status();
-            let text = resp
-                .into_string()
+            let text = read_response_text(resp)
                 .with_context(|| format!("Failed reading body from {}", url))?;
             Ok((status, text))
         }
         Err(ureq::Error::Status(code, resp)) => {
-            let text = resp.into_string().unwrap_or_default();
+            let text = read_response_text(resp).unwrap_or_default();
             Ok((code, text))
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("HTTP POST to {} failed: {}", url, t)),
