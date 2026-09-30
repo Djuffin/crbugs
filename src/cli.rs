@@ -85,7 +85,11 @@ EXAMPLES:
      $ crbugs 563075803 --max-comments 10
 
   9. Include field-change history (status, assignee, component, label diffs) in the timeline:
-     $ crbugs 563075803 --include-field-updates";
+     $ crbugs 563075803 --include-field-updates
+
+  10. Force corp authentication (via gcert) or public unauthenticated access:
+     $ crbugs 556233928 --auth corp
+     $ crbugs 563075803 --no-auth";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -93,6 +97,16 @@ pub enum OutputFormat {
     Markdown,
     /// Structured JSON representation of the issue bundle or search results
     Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum AuthMode {
+    /// Automatically use corp gcert auth (sso-cred-helper + sso_client) if available, falling back to public
+    Auto,
+    /// Require corp authentication via issuetracker.corp.googleapis.com/v1
+    Corp,
+    /// Public unauthenticated access via issues.chromium.org
+    None,
 }
 
 #[derive(Debug, Parser)]
@@ -202,6 +216,19 @@ pub struct Cli {
     #[arg(short = 'j', long = "concurrency", default_value_t = 4, value_name = "N")]
     pub concurrency: usize,
 
+    /// Authentication mode: auto (use corp gcert auth if available, else public), corp, or none
+    #[arg(
+        long = "auth",
+        value_enum,
+        default_value_t = AuthMode::Auto,
+        value_name = "MODE"
+    )]
+    pub auth: AuthMode,
+
+    /// Disable corp authentication and use public unauthenticated access (shorthand for --auth=none)
+    #[arg(long = "no-auth")]
+    pub no_auth: bool,
+
     /// Base URL for the Issue Tracker web frontend
     #[arg(
         long = "base-url",
@@ -230,6 +257,14 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Returns the effective `AuthMode` taking `--no-auth` into account.
+    pub fn effective_auth_mode(&self) -> AuthMode {
+        if self.no_auth {
+            AuthMode::None
+        } else {
+            self.auth
+        }
+    }
     /// Returns `Some(query_string)` if the CLI was invoked in search mode, or `None` for single-issue mode.
     pub fn build_search_query(&self) -> Result<Option<String>> {
         let mut parts: Vec<String> = Vec::new();

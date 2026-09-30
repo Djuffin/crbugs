@@ -180,3 +180,59 @@ fn test_search_issues_by_user_and_status() {
     assert!(!assigned_md.contains("`FIXED`"));
 }
 
+#[test]
+fn test_corp_authenticated_fetch_and_attachments() {
+    let client = CrbugClient::new_with_auth(
+        "https://issues.chromium.org".to_string(),
+        "https://usercontent.issues.chromium.org".to_string(),
+        None,
+        crbugs::cli::AuthMode::Auto,
+    )
+    .expect("Failed to create CrbugClient with Auto auth");
+
+    if !client.is_corp_authenticated() {
+        eprintln!("Skipping corp auth assertions: corp credentials not active in test environment");
+        return;
+    }
+
+    let mut bundle = client
+        .fetch_issue_bundle(TEST_ISSUE_ID, true, None)
+        .expect("Failed to fetch issue 563075803 via corp API");
+
+    assert_eq!(bundle.issue_id, TEST_ISSUE_ID);
+    assert!(bundle.title.contains("HEVC hardware decode"));
+    assert_eq!(bundle.component_id, 1456526);
+    assert!(!bundle.component_path.is_empty());
+
+    // In corp mode, email addresses are unredacted!
+    assert_eq!(bundle.assignee.as_deref(), Some("eugene@chromium.org"));
+
+    let tmp = tempdir().expect("Failed to create temp dir");
+    let md_path = tmp.path().join("corp_issue.md");
+    let att_dir = tmp.path().join("corp_attachments");
+
+    download_bundle_attachments(
+        &client,
+        &mut bundle,
+        &att_dir,
+        Some(&md_path),
+        10 * 1024 * 1024,
+        4,
+        true,
+    )
+    .expect("Failed to download attachments via corp API");
+
+    for expected_name in ["analyze.py", "seek_test.html", "seq_server.py"] {
+        let att = bundle
+            .attachments
+            .iter()
+            .find(|a| a.filename == expected_name)
+            .unwrap_or_else(|| panic!("Missing corp attachment {}", expected_name));
+        assert_eq!(att.download_status, AttachmentDownloadStatus::Downloaded);
+        let local_path = att.local_path.as_ref().expect("Missing local_path");
+        assert!(local_path.exists());
+        assert!(std::fs::metadata(local_path).unwrap().len() > 0);
+    }
+}
+
+

@@ -4,6 +4,7 @@ pub mod client;
 pub mod jspb;
 pub mod markdown;
 pub mod models;
+pub mod protojson;
 
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
@@ -15,17 +16,23 @@ use crate::markdown::{render_issue_markdown, render_search_markdown};
 use crate::models::AttachmentDownloadStatus;
 
 pub fn run(cli: Cli) -> Result<()> {
-    let client = CrbugClient::new(
+    let client = CrbugClient::new_with_auth(
         cli.base_url.clone(),
         cli.usercontent_url.clone(),
         cli.cookie.clone(),
+        cli.effective_auth_mode(),
     )?;
+    let auth_label = if client.is_corp_authenticated() {
+        "corp auth"
+    } else {
+        "public"
+    };
 
     if let Some(search_query) = cli.build_search_query()? {
         if !cli.quiet {
             eprintln!(
-                "Searching issues on {} for `{}` (limit {}, sort `{}`)...",
-                cli.base_url, search_query, cli.limit, cli.sort
+                "Searching issues ({}) for `{}` (limit {}, sort `{}`)...",
+                auth_label, search_query, cli.limit, cli.sort
             );
         }
 
@@ -77,7 +84,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let issue_id = parse_issue_id(raw_issue)?;
 
     if !cli.quiet {
-        eprintln!("Fetching issue {} from {}...", issue_id, cli.base_url);
+        eprintln!("Fetching issue {} ({})...", issue_id, auth_label);
     }
 
     let mut bundle =
