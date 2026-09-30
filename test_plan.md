@@ -24,10 +24,10 @@
   ### 4. File Export & Attachment Downloads
   Using a temporary directory $TMPDIR:
 
-  - Export with attachments (-o): crbugs 563075803 --no-auth -o "$TMPDIR/issue.md" creates $TMPDIR/issue.md, downloads 3 files into $TMPDIR/attachments/, and rewrites attachment links in issue.md to .
-  /attachments/....
-  - Skip attachments (--skip-attachments): crbugs 563075803 --no-auth -o "$TMPDIR/no_att/issue.md" --skip-attachments creates issue.md without creating $TMPDIR/no_att/attachments/.
-  - Max attachment size (--max-attachment-size 3000): Downloads attachments < 3000 bytes and marks larger ones as Skipped (exceeds --max-attachment-size).
+  - Full export with attachments (-o): `crbugs 563075803 --no-auth -o "$TMPDIR/full/issue.md"` creates `$TMPDIR/full/issue.md`, downloads all 3 files (`82130204_analyze.py`, `82116102_seek_test.html`, `82130205_seq_server.py`) into `$TMPDIR/full/attachments/`, verifies each file is non-empty, and rewrites attachment links in `issue.md` to `./attachments/...`.
+  - Custom attachments dir with JSON output (-a): `crbugs 563075803 --no-auth -a "$TMPDIR/custom_att" --format json` downloads attachments into `$TMPDIR/custom_att/` while emitting JSON with `download_status.state == "downloaded"`.
+  - Skip attachments (--skip-attachments): `crbugs 563075803 --no-auth -o "$TMPDIR/no_att/issue.md" --skip-attachments` creates `issue.md` with `Remote URL` status and without creating `$TMPDIR/no_att/attachments/`.
+  - Max attachment size (--max-attachment-size 3000): `crbugs 563075803 --no-auth -o "$TMPDIR/sized/issue.md" --max-attachment-size 3000` downloads the 2 attachments `< 3000` bytes and marks the larger one as `Skipped (exceeds --max-attachment-size)`.
 
   ### 5. Corp Auth (--auth corp) Smoke Check
 
@@ -49,10 +49,10 @@
     "$CRBUGS" --version
     "$CRBUGS" --help >/dev/null
     for id in "563075803" "https://crbug.com/563075803" "b/563075803"; do
-      "$CRBUGS" "$id" --no-auth -q | head -n 5 | grep -q "issue_id: 563075803"
+      "$CRBUGS" "$id" --no-auth -q | grep -m1 -q "^issue_id: 563075803$"
     done
     for legacy_id in "1275474" "https://crbug.com/1275474" "crbug.com/chromium/1275474" "https://bugs.chromium.org/p/chromium/issues/detail?id=1275474"; do
-      "$CRBUGS" "$legacy_id" --no-auth -q --max-comments 3 | head -n 5 | grep -q "issue_id: 40207080"
+      "$CRBUGS" "$legacy_id" --no-auth -q --max-comments 3 | grep -m1 -q "^issue_id: 40207080$"
     done
     ! "$CRBUGS" 1275474 --no-auth -q | grep -q "Empty comment from Monorail migration"
     ! "$CRBUGS" --no-auth >/dev/null 2>&1
@@ -71,10 +71,30 @@
       | jq -e '.issues | length == 5' >/dev/null
 
     echo "=== 4. File Export & Attachments ==="
-    "$CRBUGS" 563075803 --no-auth -q -o "$TMPDIR/issue.md" --max-attachment-size 3000
-    test -f "$TMPDIR/issue.md"
-    test "$(ls -1 "$TMPDIR/attachments" | wc -l)" -eq 2
-    grep -q "Skipped (exceeds \`--max-attachment-size\`)" "$TMPDIR/issue.md"
+    # 4a. Full export with all attachments
+    "$CRBUGS" 563075803 --no-auth -q -o "$TMPDIR/full/issue.md"
+    test -f "$TMPDIR/full/issue.md"
+    for f in "82130204_analyze.py" "82116102_seek_test.html" "82130205_seq_server.py"; do
+      test -s "$TMPDIR/full/attachments/$f"
+      grep -q "./attachments/$f" "$TMPDIR/full/issue.md"
+    done
+
+    # 4b. Explicit --attachments-dir (-a) with JSON stdout
+    "$CRBUGS" 563075803 --no-auth -q -a "$TMPDIR/custom_att" --format json \
+      | jq -e '(.attachments | length == 3) and all(.attachments[]; .download_status.state == "downloaded")' >/dev/null
+    test "$(ls -1 "$TMPDIR/custom_att" | wc -l)" -eq 3
+
+    # 4c. Skip attachments (--skip-attachments)
+    "$CRBUGS" 563075803 --no-auth -q -o "$TMPDIR/no_att/issue.md" --skip-attachments
+    test -f "$TMPDIR/no_att/issue.md"
+    test ! -d "$TMPDIR/no_att/attachments"
+    grep -q "Remote URL" "$TMPDIR/no_att/issue.md"
+
+    # 4d. Max attachment size filter (--max-attachment-size 3000)
+    "$CRBUGS" 563075803 --no-auth -q -o "$TMPDIR/sized/issue.md" --max-attachment-size 3000
+    test -f "$TMPDIR/sized/issue.md"
+    test "$(ls -1 "$TMPDIR/sized/attachments" | wc -l)" -eq 2
+    grep -q "Skipped (exceeds \`--max-attachment-size\`)" "$TMPDIR/sized/issue.md"
 
     echo "=== 5. Corp Auth Smoke Check ==="
     if [ -x /usr/bin/sso-cred-helper ] && [ -x /usr/bin/sso_client ]; then
