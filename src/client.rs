@@ -400,6 +400,22 @@ impl CrbugClient {
     }
 
     fn sso_get_json(&self, url: &str, token: &str) -> Result<Value> {
+        match self.sso_get_json_once(url, token) {
+            Ok(val) => Ok(val),
+            Err(err) if err.to_string().contains("HTTP 401") => {
+                // Self-heal if a cached token was revoked or expired early
+                invalidate_cached_token();
+                if let Ok(Some(fresh_token)) = mint_corp_token(AuthMode::Corp) {
+                    write_cached_token(&fresh_token);
+                    return self.sso_get_json_once(url, &fresh_token);
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn sso_get_json_once(&self, url: &str, token: &str) -> Result<Value> {
         let auth_header = format!("Authorization: Bearer {}", token);
         let output = Command::new(SSO_CLIENT_BIN)
             .arg(format!("--url={}", url))
@@ -620,6 +636,90 @@ impl CrbugClient {
     }
 }
 
+const TOKEN_CACHE_TTL_SECS: u64 = 55 * 60;
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn token_cache_path() -> std::path::PathBuf {
+    let raw_user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "default".to_string());
+    let safe_user: String = raw_user
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    std::env::temp_dir().join(format!("crbugs_sso_token_{}.json", safe_user))
+}
+
+fn read_cached_token() -> Option<String> {
+    let path = token_cache_path();
+    let meta = std::fs::metadata(&path).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return None;
+        }
+    }
+    let data = std::fs::read(&path).ok()?;
+    let val = serde_json::from_slice::<Value>(&data).ok()?;
+    let expires_at = val.get("expires_at_unix").and_then(Value::as_u64)?;
+    if current_unix_secs() >= expires_at {
+        return None;
+    }
+    val.get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn write_cached_token(token: &str) {
+    let path = token_cache_path();
+    let tmp_path = path.with_extension(format!("part.{}", std::process::id()));
+    let payload = json!({
+        "token": token,
+        "expires_at_unix": current_unix_secs() + TOKEN_CACHE_TTL_SECS,
+    });
+    let Ok(bytes) = serde_json::to_vec(&payload) else {
+        return;
+    };
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    if let Ok(mut file) = opts.open(&tmp_path) {
+        if std::io::Write::write_all(&mut file, &bytes).is_ok()
+            && std::io::Write::flush(&mut file).is_ok()
+        {
+            drop(file);
+            let _ = std::fs::rename(&tmp_path, &path);
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+}
+
+fn invalidate_cached_token() {
+    let _ = std::fs::remove_file(token_cache_path());
+}
+
 fn resolve_corp_token(auth_mode: AuthMode) -> Result<Option<String>> {
     if auth_mode == AuthMode::None {
         return Ok(None);
@@ -636,6 +736,18 @@ fn resolve_corp_token(auth_mode: AuthMode) -> Result<Option<String>> {
         };
     }
 
+    if let Some(cached) = read_cached_token() {
+        return Ok(Some(cached));
+    }
+
+    let minted = mint_corp_token(auth_mode)?;
+    if let Some(ref tok) = minted {
+        write_cached_token(tok);
+    }
+    Ok(minted)
+}
+
+fn mint_corp_token(auth_mode: AuthMode) -> Result<Option<String>> {
     let output = Command::new(SSO_CRED_HELPER_BIN)
         .arg("-force")
         .arg("-scopes=https://www.googleapis.com/auth/buganizer")
