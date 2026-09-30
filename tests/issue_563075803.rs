@@ -171,6 +171,7 @@ fn test_search_issues_by_user_and_status() {
         "10",
         "-o",
         assigned_out.to_str().unwrap(),
+        "--no-auth",
         "--quiet",
     ]);
     crbugs::run(cli_assigned).expect("Search assigned issues failed");
@@ -178,6 +179,24 @@ fn test_search_issues_by_user_and_status() {
     assert!(assigned_md.contains("assignee:eugene@chromium.org status:ASSIGNED"));
     assert!(assigned_md.contains("`ASSIGNED`"));
     assert!(!assigned_md.contains("`FIXED`"));
+
+    // 3. Search issues by Chromium component (-c Blink>Media>WebCodecs)
+    let comp_out = tmp.path().join("webcodecs.md");
+    let cli_comp = Cli::parse_from([
+        "crbugs",
+        "-c",
+        "Blink>Media>WebCodecs",
+        "-l",
+        "5",
+        "-o",
+        comp_out.to_str().unwrap(),
+        "--no-auth",
+        "--quiet",
+    ]);
+    crbugs::run(cli_comp).expect("Search by component failed");
+    let comp_md = std::fs::read_to_string(&comp_out).unwrap();
+    assert!(comp_md.contains("customfield1222907:\"Blink>Media>WebCodecs\""));
+    assert!(comp_md.contains("Blink>Media>WebCodecs"));
 }
 
 #[test]

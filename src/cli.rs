@@ -12,8 +12,9 @@ Features:
   • Fetch a single issue by ID or URL: title, description, status, priority, severity, type,
     reporter, assignee, CCs, component hierarchy, hotlists, blocking/blocked-by links, and
     Chromium custom fields.
-  • Search issues by assignee (--assignee / -u), reporter (--reporter), CC (--cc), status
-    (--status / -s: fixed, assigned, accepted, new, open, closed, verified, etc.), or raw query.
+  • Search issues by assignee (--assignee / -u), reporter (--reporter), CC (--cc), component
+    (--component / -c), status (--status / -s: fixed, assigned, accepted, new, open, closed,
+    verified, etc.), or raw query.
   • Reads the full comment thread in chronological order, coalescing attachment uploads
     with their associated comments.
   • Downloads binary attachments concurrently when exporting to a file (-o) or when
@@ -23,7 +24,7 @@ Features:
 const AFTER_LONG_HELP: &str = "\
 QUERY SYNTAX (-Q / --query):
   The -Q / --query flag accepts the Google Issue Tracker search query language and can be
-  used standalone or combined with -u/--assignee, --reporter, --cc, and -s/--status:
+  used standalone or combined with -u/--assignee, --reporter, --cc, -c/--component, and -s/--status:
 
   • User filters:
       assignee:<email>          Issues assigned to user
@@ -45,6 +46,7 @@ QUERY SYNTAX (-Q / --query):
       priority:(P0|P1|P2|P3|P4)
       severity:(S0|S1|S2|S3|S4)
       type:(BUG|FEATURE_REQUEST|VULNERABILITY|TASK|...)
+      customfield1222907:\"<tag>\"  Filter by Chromium Component Tag (or use -c <tag>)
       componentid:<id>          Filter by numeric component ID (e.g. componentid:1456526)
       hotlistid:<id>            Filter by hotlist ID
       title:\"<phrase>\"          Match phrase in issue title
@@ -72,24 +74,29 @@ EXAMPLES:
      $ crbugs --assignee eugene@chromium.org --status fixed
      $ crbugs -u eugene@chromium.org -s assigned,accepted --limit 20
 
-  6. Find all issues worked on or resolved in a quarter (e.g. Q3) using -Q:
+  6. Filter issues by Chromium component tag or numeric component ID (-c / --component):
+     $ crbugs -c \"Blink>Media>WebCodecs\" -s open
+     $ crbugs \"Blink>Media>WebCodecs\" -s new,assigned
+     $ crbugs -c 1456526 -s open
+
+  7. Find all issues worked on or resolved in a quarter (e.g. Q3) using -Q:
      $ crbugs -u eugene@chromium.org -Q \"modified:2026-07-01..2026-09-30\" -l 100
      $ crbugs -u eugene@chromium.org -s fixed,verified -Q \"resolved:2026-07-01..2026-09-30\" -l 100
      $ crbugs -Q \"(assignee:eugene@chromium.org OR commentby:eugene@chromium.org) modified:2026-07-01..2026-09-30\" -l 200
 
-  7. Emit structured JSON to stdout:
+  8. Emit structured JSON to stdout:
      $ crbugs 563075803 --format json
      $ crbugs -u eugene@chromium.org -s fixed --format json
 
-  8. Limit output to the initial description plus the last 10 comments:
+  9. Limit output to the initial description plus the last 10 comments:
      $ crbugs 563075803 --max-comments 10
 
-  9. Include field-change history (status, assignee, component, label diffs) in the timeline:
-     $ crbugs 563075803 --include-field-updates
+  10. Include field-change history (status, assignee, component, label diffs) in the timeline:
+      $ crbugs 563075803 --include-field-updates
 
-  10. Force corp authentication (via gcert) or public unauthenticated access:
-     $ crbugs 556233928 --auth corp
-     $ crbugs 563075803 --no-auth";
+  11. Force corp authentication (via gcert) or public unauthenticated access:
+      $ crbugs 556233928 --auth corp
+      $ crbugs 563075803 --no-auth";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputFormat {
@@ -119,8 +126,8 @@ pub enum AuthMode {
     arg_required_else_help = true
 )]
 pub struct Cli {
-    /// Issue identifier (e.g. 563075803, https://crbug.com/563075803, b/563075803)
-    /// or user email to search for assigned issues (e.g. eugene@chromium.org)
+    /// Issue identifier (e.g. 563075803, https://crbug.com/563075803, b/563075803),
+    /// user email (e.g. eugene@chromium.org), or Chromium component path (e.g. Blink>Media>WebCodecs)
     #[arg(value_name = "ISSUE_OR_USER")]
     pub issue: Option<String>,
 
@@ -141,6 +148,16 @@ pub struct Cli {
     #[arg(long = "cc", value_name = "EMAIL")]
     pub cc: Option<String>,
 
+    /// Filter search results by Chromium component tag (e.g. "Blink>Media>WebCodecs",
+    /// "Internals>Media>Video") or numeric component ID (e.g. "1456526", "1456190+")
+    #[arg(
+        short = 'c',
+        long = "component",
+        value_delimiter = ',',
+        value_name = "COMPONENT"
+    )]
+    pub component: Vec<String>,
+
     /// Filter search results by status (comma-separated or repeated):
     /// open, closed, new, assigned, accepted (or in_progress), fixed, verified,
     /// not_reproducible, intended_behavior, obsolete, infeasible, duplicate, wontfix
@@ -153,7 +170,7 @@ pub struct Cli {
     pub status: Vec<String>,
 
     /// Issue Tracker search query (e.g. "modified:2026-07-01..2026-09-30", "resolved>=2026-07-01",
-    /// "commentby:user@chromium.org", "priority:P0|P1"). Can be combined with -u and -s
+    /// "commentby:user@chromium.org", "priority:P0|P1"). Can be combined with -u, -c, and -s
     #[arg(short = 'Q', long = "query", value_name = "QUERY")]
     pub query: Option<String>,
 
@@ -269,8 +286,9 @@ impl Cli {
     pub fn build_search_query(&self) -> Result<Option<String>> {
         let mut parts: Vec<String> = Vec::new();
 
-        // Check if the positional argument is an email address or raw search query
+        // Check if the positional argument is an email address, component path, or raw search query
         let mut positional_assignee: Option<&str> = None;
+        let mut positional_component: Option<String> = None;
         let mut positional_query: Option<&str> = None;
 
         if let Some(ref raw_target) = self.issue {
@@ -278,6 +296,9 @@ impl Cli {
             if parse_issue_id(trimmed).is_err() {
                 if trimmed.contains('@') && !trimmed.contains(':') && !trimmed.contains(' ') {
                     positional_assignee = Some(trimmed);
+                } else if trimmed.contains('>') && !trimmed.contains(':') && !trimmed.contains('@')
+                {
+                    positional_component = Some(trimmed.to_string());
                 } else if trimmed.contains(':') {
                     positional_query = Some(trimmed);
                 }
@@ -287,9 +308,11 @@ impl Cli {
         let has_search_flags = self.assignee.is_some()
             || self.reporter.is_some()
             || self.cc.is_some()
+            || !self.component.is_empty()
             || !self.status.is_empty()
             || self.query.is_some()
             || positional_assignee.is_some()
+            || positional_component.is_some()
             || positional_query.is_some();
 
         if !has_search_flags {
@@ -317,6 +340,14 @@ impl Cli {
             if !trimmed.is_empty() {
                 parts.push(format!("cc:{}", trimmed));
             }
+        }
+
+        let mut all_components = self.component.clone();
+        if let Some(comp) = positional_component {
+            all_components.push(comp);
+        }
+        if !all_components.is_empty() {
+            parts.push(build_component_filter(&all_components)?);
         }
 
         if !self.status.is_empty() {
@@ -451,6 +482,51 @@ pub fn build_status_filter(statuses: &[String]) -> Result<String> {
     }
 }
 
+/// Translates Chromium component tag paths (e.g. `Blink>Media>WebCodecs` -> `customfield1222907:"Blink>Media>WebCodecs"`)
+/// or numeric component IDs (e.g. `1456526` -> `componentid:1456526`, `1456190+` -> `componentid:1456190+`)
+/// into an Issue Tracker query clause.
+pub fn build_component_filter(components: &[String]) -> Result<String> {
+    let mut clauses: Vec<String> = Vec::new();
+
+    for raw in components {
+        let trimmed = raw.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let numeric_part = trimmed.strip_suffix('+').unwrap_or(trimmed);
+        let clause = if !numeric_part.is_empty() && numeric_part.chars().all(|c| c.is_ascii_digit())
+        {
+            format!("componentid:{}", trimmed)
+        } else {
+            let normalized = trimmed
+                .split('>')
+                .map(str::trim)
+                .filter(|seg| !seg.is_empty())
+                .collect::<Vec<_>>()
+                .join(">");
+            if normalized.is_empty() {
+                continue;
+            }
+            format!("customfield1222907:\"{}\"", normalized)
+        };
+
+        if !clauses.iter().any(|existing| existing == &clause) {
+            clauses.push(clause);
+        }
+    }
+
+    if clauses.is_empty() {
+        return Err(anyhow!("Component filter cannot be empty"));
+    }
+
+    if clauses.len() == 1 {
+        Ok(clauses.remove(0))
+    } else {
+        Ok(format!("({})", clauses.join(" OR ")))
+    }
+}
+
 /// Parses an issue identifier from a raw numeric string, `b/<id>`, `crbug.com/<id>`,
 /// or `https://issues.chromium.org/issues/<id>` URL.
 pub fn parse_issue_id(input: &str) -> Result<i64> {
@@ -544,6 +620,40 @@ mod tests {
     }
 
     #[test]
+    fn test_build_component_filter() {
+        assert_eq!(
+            build_component_filter(&["Blink>Media>WebCodecs".to_string()]).unwrap(),
+            "customfield1222907:\"Blink>Media>WebCodecs\""
+        );
+        assert_eq!(
+            build_component_filter(&["Internals > Media > Video".to_string()]).unwrap(),
+            "customfield1222907:\"Internals>Media>Video\""
+        );
+        assert_eq!(
+            build_component_filter(&["1456526".to_string()]).unwrap(),
+            "componentid:1456526"
+        );
+        assert_eq!(
+            build_component_filter(&["1456190+".to_string()]).unwrap(),
+            "componentid:1456190+"
+        );
+        assert_eq!(
+            build_component_filter(&[
+                "Blink>Media>WebCodecs".to_string(),
+                "Internals>Media>Video".to_string()
+            ])
+            .unwrap(),
+            "(customfield1222907:\"Blink>Media>WebCodecs\" OR customfield1222907:\"Internals>Media>Video\")"
+        );
+
+        let positional_cli = Cli::parse_from(["crbugs", "Blink>Media>WebCodecs", "-s", "open"]);
+        assert_eq!(
+            positional_cli.build_search_query().unwrap().as_deref(),
+            Some("customfield1222907:\"Blink>Media>WebCodecs\" status:open")
+        );
+    }
+
+    #[test]
     fn test_default_stdout_and_explicit_file_export() {
         let default_cli = Cli::parse_from(["crbugs", "563075803"]);
         assert!(default_cli.resolved_output_path().is_none());
@@ -565,5 +675,3 @@ mod tests {
         assert!(stdout_with_att_cli.should_download_attachments());
     }
 }
-
-
