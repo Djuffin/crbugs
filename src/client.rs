@@ -46,7 +46,11 @@ impl CrbugClient {
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(120))
             .timeout_write(Duration::from_secs(30))
-            .user_agent("crbugs-cli/0.1 (+https://issues.chromium.org)")
+            .user_agent(concat!(
+                "crbugs-cli/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://issues.chromium.org)"
+            ))
             .build();
 
         let cookie = cookie.and_then(|c| {
