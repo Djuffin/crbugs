@@ -160,27 +160,32 @@ pub fn render_issue_markdown(bundle: &IssueBundle) -> String {
     if bundle.vote_count > 0 {
         let _ = writeln!(out, "| **Votes** | `{}` |", bundle.vote_count);
     }
+    let issue_base_url = bundle
+        .url
+        .rsplit_once("/issues/")
+        .map(|(base, _)| base)
+        .unwrap_or("https://issues.chromium.org");
     if let Some(canon) = bundle.canonical_issue_id {
         let _ = writeln!(
             out,
-            "| **Duplicate Of** | [{}](https://issues.chromium.org/issues/{}) |",
-            canon, canon
+            "| **Duplicate Of** | [{}]({}/issues/{}) |",
+            canon, issue_base_url, canon
         );
     }
     if !bundle.duplicate_issue_ids.is_empty() {
-        let links = format_issue_links(&bundle.duplicate_issue_ids);
+        let links = format_issue_links(&bundle.duplicate_issue_ids, issue_base_url);
         let _ = writeln!(out, "| **Duplicates** | {} |", links);
     }
     if !bundle.blocked_by_ids.is_empty() {
-        let links = format_issue_links(&bundle.blocked_by_ids);
+        let links = format_issue_links(&bundle.blocked_by_ids, issue_base_url);
         let _ = writeln!(out, "| **Blocked By** | {} |", links);
     }
     if !bundle.blocking_ids.is_empty() {
-        let links = format_issue_links(&bundle.blocking_ids);
+        let links = format_issue_links(&bundle.blocking_ids, issue_base_url);
         let _ = writeln!(out, "| **Blocking** | {} |", links);
     }
     if !bundle.parent_issue_ids.is_empty() {
-        let links = format_issue_links(&bundle.parent_issue_ids);
+        let links = format_issue_links(&bundle.parent_issue_ids, issue_base_url);
         let _ = writeln!(out, "| **Parent Issues** | {} |", links);
     }
     if !bundle.hotlist_ids.is_empty() {
@@ -373,9 +378,9 @@ fn render_attachment_item(out: &mut String, att: &AttachmentMeta) {
     }
 }
 
-fn format_issue_links(ids: &[i64]) -> String {
+fn format_issue_links(ids: &[i64], base_url: &str) -> String {
     ids.iter()
-        .map(|id| format!("[{}](https://issues.chromium.org/issues/{})", id, id))
+        .map(|id| format!("[{}]({}/issues/{})", id, base_url, id))
         .collect::<Vec<_>>()
         .join(", ")
 }

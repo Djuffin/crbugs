@@ -70,18 +70,16 @@ pub struct CommentEntry {
     pub field_updates: Vec<FieldDiff>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Map from custom field ID to `(name, field_type)`.
+pub type CustomFieldDefMap = std::collections::HashMap<i64, (String, String)>;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FormattingMode {
+    #[default]
     Plain,
     Markdown,
     Literal,
-}
-
-impl Default for FormattingMode {
-    fn default() -> Self {
-        FormattingMode::Plain
-    }
 }
 
 /// Metadata and download state for an issue attachment.

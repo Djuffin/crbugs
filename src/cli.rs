@@ -541,15 +541,17 @@ pub fn parse_issue_id(input: &str) -> Result<i64> {
         }
     }
 
-    let patterns = [
-        r"(?:issues\.chromium\.org|issuetracker\.google\.com|b\.corp\.google\.com)/(?:u/\d+/)?issues/(\d+)",
-        r"crbug\.com/(?:[a-zA-Z0-9_-]+/)?(\d+)",
-        r"[?&]id=(\d+)",
-        r"^(?:b/|b:|crbug:|issue:)(\d+)$",
-    ];
+    static PATTERNS: std::sync::OnceLock<[Regex; 4]> = std::sync::OnceLock::new();
+    let regexes = PATTERNS.get_or_init(|| {
+        [
+            Regex::new(r"(?:issues\.chromium\.org|issuetracker\.google\.com|b\.corp\.google\.com)/(?:u/\d+/)?issues/(\d+)").expect("valid regex"),
+            Regex::new(r"crbug\.com/(?:[a-zA-Z0-9_-]+/)?(\d+)").expect("valid regex"),
+            Regex::new(r"[?&]id=(\d+)").expect("valid regex"),
+            Regex::new(r"^(?:b/|b:|crbug:|issue:)(\d+)$").expect("valid regex"),
+        ]
+    });
 
-    for pat in patterns {
-        let re = Regex::new(pat).expect("valid regex");
+    for re in regexes {
         if let Some(caps) = re.captures(trimmed) {
             if let Some(m) = caps.get(1) {
                 if let Ok(id) = m.as_str().parse::<i64>() {

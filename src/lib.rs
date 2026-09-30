@@ -8,6 +8,7 @@ pub mod protojson;
 
 use anyhow::{anyhow, Context, Result};
 use std::io::Write;
+use std::path::Path;
 
 use crate::attachments::download_bundle_attachments;
 use crate::cli::{parse_issue_id, Cli, OutputFormat};
@@ -27,6 +28,8 @@ pub fn run(cli: Cli) -> Result<()> {
     } else {
         "public"
     };
+
+    let output_path = cli.resolved_output_path();
 
     if let Some(search_query) = cli.build_search_query()? {
         if !cli.quiet {
@@ -48,17 +51,9 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         };
 
-        if let Some(ref path) = cli.resolved_output_path() {
-            if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).with_context(|| {
-                        format!("Failed to create directory {}", parent.display())
-                    })?;
-                }
-            }
-            std::fs::write(path, rendered.as_bytes())
-                .with_context(|| format!("Failed to write output file {}", path.display()))?;
+        write_output(&rendered, output_path.as_deref())?;
 
+        if let Some(ref path) = output_path {
             if !cli.quiet {
                 eprintln!(
                     "Exported {} search result(s) (of {} total) to {}",
@@ -67,12 +62,6 @@ pub fn run(cli: Cli) -> Result<()> {
                     path.display()
                 );
             }
-        } else {
-            let mut stdout = std::io::stdout().lock();
-            stdout
-                .write_all(rendered.as_bytes())
-                .context("Failed to write to stdout")?;
-            stdout.flush()?;
         }
 
         return Ok(());
@@ -89,8 +78,6 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let mut bundle =
         client.fetch_issue_bundle(issue_id, cli.include_field_updates, cli.max_comments)?;
-
-    let output_path = cli.resolved_output_path();
 
     if cli.should_download_attachments() && !bundle.attachments.is_empty() {
         let attachments_dir = cli.resolved_attachments_dir(issue_id);
@@ -122,16 +109,9 @@ pub fn run(cli: Cli) -> Result<()> {
         }
     };
 
-    if let Some(ref path) = output_path {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("Failed to create directory {}", parent.display()))?;
-            }
-        }
-        std::fs::write(path, rendered.as_bytes())
-            .with_context(|| format!("Failed to write output file {}", path.display()))?;
+    write_output(&rendered, output_path.as_deref())?;
 
+    if let Some(ref path) = output_path {
         if !cli.quiet {
             let downloaded_count = bundle
                 .attachments
@@ -152,6 +132,21 @@ pub fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn write_output(rendered: &str, output_path: Option<&Path>) -> Result<()> {
+    if let Some(path) = output_path {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+            }
+        }
+        std::fs::write(path, rendered.as_bytes())
+            .with_context(|| format!("Failed to write output file {}", path.display()))?;
     } else {
         let mut stdout = std::io::stdout().lock();
         stdout
@@ -159,6 +154,5 @@ pub fn run(cli: Cli) -> Result<()> {
             .context("Failed to write to stdout")?;
         stdout.flush()?;
     }
-
     Ok(())
 }

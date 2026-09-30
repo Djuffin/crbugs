@@ -3,13 +3,14 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
 
-use crate::jspb::{as_i64, as_u64};
-use crate::models::{
-    AttachmentDownloadStatus, AttachmentMeta, CommentEntry, FieldDiff, FormattingMode, IssueBundle,
-    ResolvedCustomField, SearchIssuesResult,
+use crate::jspb::{
+    as_i64, as_u64, build_attachment_meta, build_collection_diff, coalesce_issue_updates,
+    map_field_int_code, parse_i64_list, parse_string_list, resolve_custom_fields, RawIssueUpdate,
 };
-
-const GROUPING_WINDOW_SECS: i64 = 3600;
+use crate::models::{
+    AttachmentMeta, CommentEntry, CustomFieldDefMap, FieldDiff, FormattingMode, IssueBundle,
+    SearchIssuesResult,
+};
 
 fn parse_rfc3339(v: Option<&Value>) -> Option<DateTime<Utc>> {
     let s = v?.as_str()?;
@@ -36,23 +37,6 @@ fn parse_user_obj(v: Option<&Value>) -> Option<String> {
 fn parse_user_obj_list(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(|u| parse_user_obj(Some(u))).collect())
-        .unwrap_or_default()
-}
-
-fn parse_i64_array(v: Option<&Value>) -> Vec<i64> {
-    v.and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(as_i64).collect())
-        .unwrap_or_default()
-}
-
-fn parse_string_array(v: Option<&Value>) -> Vec<String> {
-    v.and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect()
-        })
         .unwrap_or_default()
 }
 
@@ -125,7 +109,7 @@ pub fn check_v1_error(root: &Value) -> Result<()> {
             .and_then(Value::as_str)
             .unwrap_or("Unknown Issue Tracker v1 API error");
         return Err(anyhow!(
-            "Issue Tracker v1 API error (HTTP {} {}): {}",
+            "Corp API error (HTTP {} {}): {}",
             code,
             status,
             message
@@ -138,7 +122,7 @@ pub fn check_v1_error(root: &Value) -> Result<()> {
 pub fn parse_v1_issue(
     root: &Value,
     web_base_url: &str,
-) -> Result<(IssueBundle, HashMap<i64, (String, String)>)> {
+) -> Result<(IssueBundle, CustomFieldDefMap)> {
     check_v1_error(root)?;
 
     let issue_id = root
@@ -184,14 +168,17 @@ pub fn parse_v1_issue(
     let ccs = parse_user_obj_list(state.get("ccs"));
     let collaborators = parse_user_obj_list(state.get("collaborators"));
     let canonical_issue_id = state.get("canonicalIssueId").and_then(as_i64);
-    let blocked_by_ids = parse_i64_array(state.get("blockedByIssueIds"));
-    let blocking_ids = parse_i64_array(state.get("blockingIssueIds"));
-    let hotlist_ids = parse_i64_array(state.get("hotlistIds"));
-    let duplicate_issue_ids = parse_i64_array(state.get("duplicateIssueIds"));
-    let found_in_versions = parse_string_array(state.get("foundInVersions"));
-    let targeted_to_versions = parse_string_array(state.get("targetedToVersions"));
-    let verified_in_versions = parse_string_array(state.get("verifiedInVersions"));
-    let in_prod = state.get("inProd").and_then(Value::as_bool).unwrap_or(false);
+    let blocked_by_ids = parse_i64_list(state.get("blockedByIssueIds"));
+    let blocking_ids = parse_i64_list(state.get("blockingIssueIds"));
+    let hotlist_ids = parse_i64_list(state.get("hotlistIds"));
+    let duplicate_issue_ids = parse_i64_list(state.get("duplicateIssueIds"));
+    let found_in_versions = parse_string_list(state.get("foundInVersions"));
+    let targeted_to_versions = parse_string_list(state.get("targetedToVersions"));
+    let verified_in_versions = parse_string_list(state.get("verifiedInVersions"));
+    let in_prod = state
+        .get("inProd")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let access_level = state
         .get("accessLimit")
         .or_else(|| root.get("accessLimit"))
@@ -206,14 +193,14 @@ pub fn parse_v1_issue(
     let verified_time = parse_rfc3339(root.get("verifiedTime"));
     let vote_count = root.get("voteCount").and_then(as_i64).unwrap_or(0);
     let version = root.get("version").and_then(as_i64);
-    let parent_issue_ids = parse_i64_array(root.get("parentIssueIds"));
+    let parent_issue_ids = parse_i64_list(root.get("parentIssueIds"));
     let is_archived = root
         .get("isArchived")
         .and_then(Value::as_bool)
         .or_else(|| state.get("isArchived").and_then(Value::as_bool))
         .unwrap_or(false);
 
-    let mut custom_field_defs: HashMap<i64, (String, String)> = HashMap::new();
+    let mut custom_field_defs: CustomFieldDefMap = HashMap::new();
     if let Some(defs) = root.get("customFields").and_then(Value::as_array) {
         for def in defs {
             if let Some(def_obj) = def.as_object() {
@@ -236,36 +223,28 @@ pub fn parse_v1_issue(
         }
     }
 
-    let mut custom_fields: Vec<ResolvedCustomField> = Vec::new();
+    let mut raw_cf_values = Vec::new();
     if let Some(vals) = state.get("customFields").and_then(Value::as_array) {
         for val in vals {
             if let Some(val_obj) = val.as_object() {
                 if let Some(cf_id) = val_obj.get("customFieldId").and_then(as_i64) {
                     let value_str = extract_v1_custom_field_value(val_obj);
-                    if !value_str.is_empty() {
-                        let (name, field_type) = custom_field_defs
-                            .get(&cf_id)
-                            .cloned()
-                            .unwrap_or_else(|| (format!("field_{}", cf_id), "UNKNOWN".to_string()));
-                        custom_fields.push(ResolvedCustomField {
-                            id: cf_id,
-                            name,
-                            field_type,
-                            value: value_str,
-                        });
-                    }
+                    raw_cf_values.push((cf_id, value_str));
                 }
             }
         }
     }
-    custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    let custom_fields = resolve_custom_fields(raw_cf_values, &custom_field_defs);
 
     let fallback_description = root
         .get("description")
         .or_else(|| root.get("issueComment"))
         .and_then(Value::as_object)
         .and_then(|desc_obj| {
-            let body = desc_obj.get("comment").and_then(Value::as_str).unwrap_or("");
+            let body = desc_obj
+                .get("comment")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if body.is_empty() {
                 return None;
             }
@@ -417,29 +396,18 @@ pub fn parse_v1_search_response(
     })
 }
 
-/// Parses `ListIssueUpdatesResponse` ProtoJSON from `GET /v1/issues/{id}/issueUpdates`.
+/// Parses `ListIssueUpdatesResponse` ProtoJSON from `GET /v1/issues/{id}/issueUpdates`,
+/// sharing `coalesce_issue_updates` with the JSPB parser.
 pub fn parse_v1_updates(
     raw_updates: &[Value],
     issue_id: i64,
     usercontent_url: &str,
-    custom_field_defs: &HashMap<i64, (String, String)>,
+    custom_field_defs: &CustomFieldDefMap,
     include_field_updates: bool,
 ) -> Result<(Option<CommentEntry>, Vec<CommentEntry>, Vec<AttachmentMeta>)> {
-    struct ParsedUpdate {
-        author: String,
-        timestamp: Option<DateTime<Utc>>,
-        comment_number: Option<i32>,
-        version: Option<i64>,
-        body: String,
-        formatting_mode: FormattingMode,
-        modified_time: Option<DateTime<Utc>>,
-        attachments: Vec<AttachmentMeta>,
-        field_updates: Vec<FieldDiff>,
-    }
+    let mut parsed_updates: Vec<RawIssueUpdate> = Vec::with_capacity(raw_updates.len());
 
-    let mut parsed_updates: Vec<ParsedUpdate> = Vec::with_capacity(raw_updates.len());
-
-    for upd in raw_updates {
+    for (idx, upd) in raw_updates.iter().enumerate() {
         let Some(upd_obj) = upd.as_object() else {
             continue;
         };
@@ -451,22 +419,20 @@ pub fn parse_v1_updates(
             .and_then(as_i64)
             .map(|n| n as i32);
         let version = upd_obj.get("version").and_then(as_i64);
+        let is_initial = idx == 0 || comment_number == Some(1) || version == Some(0);
 
-        let mut body = String::new();
-        let mut formatting_mode = FormattingMode::Plain;
-        let mut modified_time = timestamp;
-
-        if let Some(comm_obj) = upd_obj.get("issueComment").and_then(Value::as_object) {
-            body = comm_obj
-                .get("comment")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .replace("\r\n", "\n");
-            formatting_mode = parse_formatting_mode_str(comm_obj.get("formattingMode"));
-            if let Some(mt) = parse_rfc3339(comm_obj.get("modifiedTime")) {
-                modified_time = Some(mt);
-            }
-        }
+        let comment = upd_obj
+            .get("issueComment")
+            .and_then(Value::as_object)
+            .map(|comm_obj| {
+                parse_v1_comment_obj(
+                    comm_obj,
+                    comment_number,
+                    Some(author.clone()),
+                    timestamp,
+                    version,
+                )
+            });
 
         let mut attachments: Vec<AttachmentMeta> = Vec::new();
         if let Some(att_list) = upd_obj.get("attachments").and_then(Value::as_array) {
@@ -481,163 +447,32 @@ pub fn parse_v1_updates(
             }
         }
 
-        let mut field_updates: Vec<FieldDiff> = Vec::new();
-        if let Some(f_list) = upd_obj.get("fieldUpdates").and_then(Value::as_array) {
-            for f_val in f_list {
-                if let Some(f_obj) = f_val.as_object() {
-                    if let Some(diff) = parse_v1_field_update(f_obj, custom_field_defs) {
-                        field_updates.push(diff);
+        let mut field_diffs: Vec<FieldDiff> = Vec::new();
+        if !is_initial {
+            if let Some(f_list) = upd_obj.get("fieldUpdates").and_then(Value::as_array) {
+                for f_val in f_list {
+                    if let Some(f_obj) = f_val.as_object() {
+                        if let Some(diff) = parse_v1_field_update(f_obj, custom_field_defs) {
+                            field_diffs.push(diff);
+                        }
                     }
                 }
             }
         }
 
-        parsed_updates.push(ParsedUpdate {
+        parsed_updates.push(RawIssueUpdate {
             author,
             timestamp,
+            comment,
             comment_number,
             version,
-            body,
-            formatting_mode,
-            modified_time,
             attachments,
-            field_updates,
+            field_diffs,
+            is_initial,
         });
     }
 
-    let mut description: Option<CommentEntry> = None;
-    let mut comments: Vec<CommentEntry> = Vec::new();
-    let mut pending_attachments: Vec<(String, Option<DateTime<Utc>>, Vec<AttachmentMeta>)> =
-        Vec::new();
-
-    for mut upd in parsed_updates {
-        let has_body = !upd.body.trim().is_empty();
-        let is_attachment_only =
-            upd.comment_number.is_none() && !has_body && !upd.attachments.is_empty();
-
-        if is_attachment_only {
-            pending_attachments.push((upd.author, upd.timestamp, upd.attachments));
-            continue;
-        }
-
-        if !pending_attachments.is_empty() {
-            let mut remaining = Vec::new();
-            for (p_author, p_time, mut p_atts) in pending_attachments.drain(..) {
-                let same_author = p_author == upd.author;
-                let within_window = match (p_time, upd.timestamp) {
-                    (Some(t1), Some(t2)) => (t2 - t1).num_seconds().abs() <= GROUPING_WINDOW_SECS,
-                    _ => true,
-                };
-                if same_author && within_window && (upd.comment_number.is_some() || has_body) {
-                    for a in &mut p_atts {
-                        a.comment_number = upd.comment_number;
-                    }
-                    upd.attachments.splice(0..0, p_atts);
-                } else {
-                    remaining.push((p_author, p_time, p_atts));
-                }
-            }
-            for (p_author, p_time, p_atts) in remaining {
-                comments.push(CommentEntry {
-                    comment_number: None,
-                    author: p_author,
-                    timestamp: p_time,
-                    modified_time: p_time,
-                    body: String::new(),
-                    formatting_mode: FormattingMode::Plain,
-                    redacted: false,
-                    version: None,
-                    attachments: p_atts,
-                    field_updates: Vec::new(),
-                });
-            }
-        }
-
-        if upd.comment_number == Some(1) {
-            description = Some(CommentEntry {
-                comment_number: Some(1),
-                author: upd.author,
-                timestamp: upd.timestamp,
-                modified_time: upd.modified_time,
-                body: upd.body,
-                formatting_mode: upd.formatting_mode,
-                redacted: false,
-                version: upd.version,
-                attachments: upd.attachments,
-                field_updates: if include_field_updates {
-                    upd.field_updates
-                } else {
-                    Vec::new()
-                },
-            });
-            continue;
-        }
-
-        let include_this = upd.comment_number.is_some()
-            || has_body
-            || !upd.attachments.is_empty()
-            || (include_field_updates && !upd.field_updates.is_empty());
-
-        if include_this {
-            comments.push(CommentEntry {
-                comment_number: upd.comment_number,
-                author: upd.author,
-                timestamp: upd.timestamp,
-                modified_time: upd.modified_time,
-                body: upd.body,
-                formatting_mode: upd.formatting_mode,
-                redacted: false,
-                version: upd.version,
-                attachments: upd.attachments,
-                field_updates: if include_field_updates {
-                    upd.field_updates
-                } else {
-                    Vec::new()
-                },
-            });
-        }
-    }
-
-    for (p_author, p_time, p_atts) in pending_attachments {
-        if let Some(last) = comments.last_mut() {
-            let same_author = last.author == p_author;
-            let within_window = match (last.timestamp, p_time) {
-                (Some(t1), Some(t2)) => (t2 - t1).num_seconds().abs() <= GROUPING_WINDOW_SECS,
-                _ => false,
-            };
-            if same_author && within_window {
-                let cnum = last.comment_number;
-                let mut p_atts = p_atts;
-                for a in &mut p_atts {
-                    a.comment_number = cnum;
-                }
-                last.attachments.extend(p_atts);
-                continue;
-            }
-        }
-        comments.push(CommentEntry {
-            comment_number: None,
-            author: p_author,
-            timestamp: p_time,
-            modified_time: p_time,
-            body: String::new(),
-            formatting_mode: FormattingMode::Plain,
-            redacted: false,
-            version: None,
-            attachments: p_atts,
-            field_updates: Vec::new(),
-        });
-    }
-
-    let mut all_attachments: Vec<AttachmentMeta> = Vec::new();
-    if let Some(ref desc) = description {
-        all_attachments.extend(desc.attachments.clone());
-    }
-    for c in &comments {
-        all_attachments.extend(c.attachments.clone());
-    }
-
-    Ok((description, comments, all_attachments))
+    Ok(coalesce_issue_updates(parsed_updates, include_field_updates))
 }
 
 fn parse_v1_attachment(
@@ -657,7 +492,7 @@ fn parse_v1_attachment(
     let raw_filename = att_obj
         .get("filename")
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or("attachment.bin")
         .to_string();
     let is_deleted = att_obj
@@ -668,38 +503,16 @@ fn parse_v1_attachment(
         .unwrap_or(false)
         || att_obj.get("attachmentDataRef").is_none();
 
-    let safe_base = sanitize_filename::sanitize(&raw_filename);
-    let safe_base = if safe_base.is_empty() {
-        "attachment.bin".to_string()
-    } else {
-        safe_base
-    };
-    let sanitized_filename = format!("{}_{}", attachment_id, safe_base);
-    let download_url = format!(
-        "{}/download/attachment/{}/{}?download=true",
-        usercontent_url.trim_end_matches('/'),
-        issue_id,
-        attachment_id
-    );
-
-    Some(AttachmentMeta {
+    Some(build_attachment_meta(
         attachment_id,
         issue_id,
         comment_number,
-        filename: raw_filename,
-        sanitized_filename,
+        raw_filename,
         content_type,
         size_bytes,
-        download_url,
         is_deleted,
-        relative_path: None,
-        local_path: None,
-        download_status: if is_deleted {
-            AttachmentDownloadStatus::DeletedOnServer
-        } else {
-            AttachmentDownloadStatus::Skipped
-        },
-    })
+        usercontent_url,
+    ))
 }
 
 fn parse_v1_field_update(
@@ -711,9 +524,7 @@ fn parse_v1_field_update(
         let old_val = single.get("oldValue");
         let new_val = single.get("newValue");
         if field_name == "custom_fields" {
-            let cf_obj = new_val
-                .or(old_val)
-                .and_then(Value::as_object)?;
+            let cf_obj = new_val.or(old_val).and_then(Value::as_object)?;
             let cf_id = cf_obj.get("customFieldId").and_then(as_i64)?;
             let label = custom_field_defs
                 .get(&cf_id)
@@ -728,9 +539,9 @@ fn parse_v1_field_update(
                 .map(extract_v1_custom_field_value)
                 .unwrap_or_default();
             let summary = match (old_s.is_empty(), new_s.is_empty()) {
-                (true, false) => format!("set to `{}`", new_s),
-                (false, true) => format!("cleared (was `{}`)", old_s),
-                (false, false) => format!("`{}` → `{}`", old_s, new_s),
+                (true, false) => format!("set to {}", new_s),
+                (false, true) => format!("cleared (was {})", old_s),
+                (false, false) => format!("{} -> {}", old_s, new_s),
                 (true, true) => return None,
             };
             return Some(FieldDiff {
@@ -738,33 +549,56 @@ fn parse_v1_field_update(
                 summary,
             });
         }
-        let old_s = format_v1_any(old_val);
-        let new_s = format_v1_any(new_val);
+        let old_s = format_v1_any(old_val, field_name);
+        let new_s = format_v1_any(new_val, field_name);
         let summary = match (old_s, new_s) {
-            (None, Some(n)) => format!("set to `{}`", n),
-            (Some(o), None) => format!("cleared (was `{}`)", o),
-            (Some(o), Some(n)) => format!("`{}` → `{}`", o, n),
+            (None, Some(n)) => format!("set to {}", n),
+            (Some(o), None) => format!("cleared (was {})", o),
+            (Some(o), Some(n)) => format!("{} -> {}", o, n),
             (None, None) => return None,
         };
         return Some(FieldDiff {
             field: field_name.to_string(),
             summary,
         });
+    } else if let Some(coll) = f_obj.get("collectionUpdate").and_then(Value::as_object) {
+        let added = coll
+            .get("addedValues")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| format_v1_any(Some(v), field_name))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let removed = coll
+            .get("removedValues")
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .filter_map(|v| format_v1_any(Some(v), field_name))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        return build_collection_diff(field_name, &added, &removed);
     }
     None
 }
 
-fn format_v1_any(v: Option<&Value>) -> Option<String> {
+fn format_v1_any(v: Option<&Value>, field_name: &str) -> Option<String> {
     let obj = v?.as_object()?;
-    if let Some(email) = obj.get("emailAddress").and_then(Value::as_str) {
-        return Some(email.to_string());
+    if let Some(email) = parse_user_obj(v) {
+        return Some(email);
     }
     if let Some(val) = obj.get("value") {
         if let Some(s) = val.as_str() {
+            if let Ok(code) = s.parse::<i64>() {
+                return Some(map_field_int_code(field_name, code));
+            }
             return Some(s.to_string());
         }
-        if let Some(i) = as_i64(val) {
-            return Some(i.to_string());
+        if let Some(code) = as_i64(val) {
+            return Some(map_field_int_code(field_name, code));
         }
         if let Some(b) = val.as_bool() {
             return Some(b.to_string());

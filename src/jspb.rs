@@ -4,34 +4,39 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::models::{
-    AttachmentDownloadStatus, AttachmentMeta, CommentEntry, FieldDiff, FormattingMode, IssueBundle,
-    ResolvedCustomField, SearchIssuesResult,
+    AttachmentDownloadStatus, AttachmentMeta, CommentEntry, CustomFieldDefMap, FieldDiff,
+    FormattingMode, IssueBundle, ResolvedCustomField, SearchIssuesResult,
 };
 
-const GROUPING_WINDOW_SECS: i64 = 3600;
+pub(crate) const GROUPING_WINDOW_SECS: i64 = 3600;
 
-/// Strips the `)]}'\n` XSSI prefix, normalizes sparse JSPB array slots (`[,`, `,,`, `,]`),
+/// Strips the `)]}'\n` XSSI prefix, normalizes sparse JSPB array slots (`[,`, `,,`, `,]`) when needed,
 /// and parses the JSON payload.
 pub fn parse_xssi_json(raw: &str) -> Result<Value> {
     let trimmed = raw.trim_start();
-    let without_xssi = if let Some(rest) = trimmed.strip_prefix(")]}'") {
-        rest.trim_start()
+    let (without_xssi, had_xssi) = if let Some(rest) = trimmed.strip_prefix(")]}'") {
+        (rest.trim_start(), true)
     } else {
-        trimmed
+        (trimmed, false)
     };
 
     if without_xssi.is_empty() {
         return Err(anyhow!("Empty response from Issue Tracker"));
     }
 
-    let normalized = normalize_sparse_jspb(without_xssi);
-    let val: Value =
-        serde_json::from_str(&normalized).context("Failed to parse Issue Tracker JSON payload")?;
+    let val: Value = if had_xssi {
+        let normalized = normalize_sparse_jspb(without_xssi);
+        serde_json::from_str(&normalized).context("Failed to parse Issue Tracker JSPB payload")?
+    } else {
+        serde_json::from_str(without_xssi)
+            .or_else(|_| serde_json::from_str(&normalize_sparse_jspb(without_xssi)))
+            .context("Failed to parse Issue Tracker JSON payload")?
+    };
 
     if let Some(err_msg) = val.get("message").and_then(Value::as_str) {
         if err_msg.contains("IamPermissionDeniedException") {
             return Err(anyhow!(
-                "{} (If this is a restricted issue, pass an authenticated session via --cookie)",
+                "{} (If this is a restricted issue, use --auth corp or pass --cookie)",
                 err_msg
             ));
         }
@@ -125,13 +130,13 @@ pub fn as_u64(v: &Value) -> Option<u64> {
     v.as_u64().or_else(|| v.as_str()?.parse::<u64>().ok())
 }
 
-fn parse_i64_list(v: Option<&Value>) -> Vec<i64> {
+pub(crate) fn parse_i64_list(v: Option<&Value>) -> Vec<i64> {
     v.and_then(Value::as_array)
         .map(|arr| arr.iter().filter_map(as_i64).collect())
         .unwrap_or_default()
 }
 
-fn parse_string_list(v: Option<&Value>) -> Vec<String> {
+pub(crate) fn parse_string_list(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -310,7 +315,7 @@ fn extract_custom_field_value(cf_val_arr: &[Value]) -> String {
 pub fn parse_issue_fetch_response(
     root: &Value,
     base_url: &str,
-) -> Result<(IssueBundle, HashMap<i64, (String, String)>)> {
+) -> Result<(IssueBundle, CustomFieldDefMap)> {
     let envelope = unwrap_named_envelope(root, "b.IssueFetchResponse")?;
     let fe_issue = envelope
         .get(1)
@@ -331,7 +336,7 @@ pub fn parse_issue_fetch_response(
 pub fn parse_it_issue_array(
     it_issue: &[Value],
     base_url: &str,
-) -> Result<(IssueBundle, HashMap<i64, (String, String)>)> {
+) -> Result<(IssueBundle, CustomFieldDefMap)> {
     let issue_id = it_issue
         .get(1)
         .and_then(as_i64)
@@ -383,12 +388,12 @@ pub fn parse_it_issue_array(
         .unwrap_or(false);
 
     // Parse CustomField definitions at `it_issue[14]` (`tag 15`)
-    let mut custom_field_defs: HashMap<i64, (String, String)> = HashMap::new();
+    let mut custom_field_defs: CustomFieldDefMap = HashMap::new();
     if let Some(defs) = it_issue.get(14).and_then(Value::as_array) {
         for def in defs {
             if let Some(def_arr) = def.as_array() {
                 if let Some(cf_id) = def_arr.first().and_then(as_i64) {
-                    let cf_type = map_custom_field_field_type_from_arr(def_arr);
+                    let cf_type = map_custom_field_type(def_arr.get(2).and_then(as_i64).unwrap_or(0));
                     let cf_name = def_arr
                         .get(4)
                         .and_then(Value::as_str)
@@ -403,29 +408,18 @@ pub fn parse_it_issue_array(
     }
 
     // Parse CustomFieldValue entries at `state[14]` (`tag 15`)
-    let mut custom_fields: Vec<ResolvedCustomField> = Vec::new();
+    let mut raw_cf_values = Vec::new();
     if let Some(vals) = state.get(14).and_then(Value::as_array) {
         for val in vals {
             if let Some(val_arr) = val.as_array() {
                 if let Some(cf_id) = val_arr.first().and_then(as_i64) {
                     let value_str = extract_custom_field_value(val_arr);
-                    if !value_str.is_empty() {
-                        let (name, field_type) = custom_field_defs
-                            .get(&cf_id)
-                            .cloned()
-                            .unwrap_or_else(|| (format!("field_{}", cf_id), "UNKNOWN".to_string()));
-                        custom_fields.push(ResolvedCustomField {
-                            id: cf_id,
-                            name,
-                            field_type,
-                            value: value_str,
-                        });
-                    }
+                    raw_cf_values.push((cf_id, value_str));
                 }
             }
         }
     }
-    custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    let custom_fields = resolve_custom_fields(raw_cf_values, &custom_field_defs);
 
     // Also parse initial description from `it_issue[43]` (`tag 44`) as fallback
     let fallback_description = it_issue
@@ -477,6 +471,30 @@ pub fn parse_it_issue_array(
     Ok((bundle, custom_field_defs))
 }
 
+pub(crate) fn resolve_custom_fields(
+    raw_values: Vec<(i64, String)>,
+    defs: &CustomFieldDefMap,
+) -> Vec<ResolvedCustomField> {
+    let mut custom_fields: Vec<ResolvedCustomField> = raw_values
+        .into_iter()
+        .filter(|(_, val)| !val.is_empty())
+        .map(|(cf_id, value)| {
+            let (name, field_type) = defs
+                .get(&cf_id)
+                .cloned()
+                .unwrap_or_else(|| (format!("field_{}", cf_id), "UNKNOWN".to_string()));
+            ResolvedCustomField {
+                id: cf_id,
+                name,
+                field_type,
+                value,
+            }
+        })
+        .collect();
+    custom_fields.sort_by(|a, b| a.name.cmp(&b.name));
+    custom_fields
+}
+
 /// Parses `b.IssueSearchResponse` from `POST /action/issues/list`.
 pub fn parse_issue_search_response(
     root: &Value,
@@ -526,10 +544,6 @@ pub fn parse_issue_search_response(
     })
 }
 
-fn map_custom_field_field_type_from_arr(def_arr: &[Value]) -> String {
-    map_custom_field_type(def_arr.get(2).and_then(as_i64).unwrap_or(0))
-}
-
 fn parse_issue_comment_array(
     comment_arr: &[Value],
     fallback_author: Option<String>,
@@ -547,7 +561,9 @@ fn parse_issue_comment_array(
         .or(fallback_author)
         .unwrap_or_else(|| "unknown".to_string());
     let modified_time = parse_timestamp(comment_arr.get(3));
-    let created_time = parse_timestamp(comment_arr.get(18)).or(fallback_time).or(modified_time);
+    let created_time = parse_timestamp(comment_arr.get(18))
+        .or(fallback_time)
+        .or(modified_time);
     let comment_number = comment_arr.get(6).and_then(as_i64).map(|n| n as i32);
     let version = comment_arr.get(7).and_then(as_i64);
     let formatting_mode = map_formatting_mode(comment_arr.get(8).and_then(as_i64));
@@ -598,94 +614,28 @@ pub fn parse_component_response(root: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Parses `b.ListIssueUpdatesResponse` from `POST /action/issues/{id}/updates`,
-/// coalescing attachment-only updates with adjacent comments by the same author.
-pub fn parse_updates_response(
-    root: &Value,
-    issue_id: i64,
-    usercontent_url: &str,
-    custom_field_defs: &HashMap<i64, (String, String)>,
+/// Intermediate representation of a single issue update shared by JSPB and ProtoJSON parsers.
+#[derive(Debug)]
+pub(crate) struct RawIssueUpdate {
+    pub author: String,
+    pub timestamp: Option<DateTime<Utc>>,
+    pub comment: Option<CommentEntry>,
+    pub comment_number: Option<i32>,
+    pub version: Option<i64>,
+    pub attachments: Vec<AttachmentMeta>,
+    pub field_diffs: Vec<FieldDiff>,
+    pub is_initial: bool,
+}
+
+/// Groups chronological `RawIssueUpdate` items using Buganizer's `UpdateGroup` rules:
+/// - Initial update (comment #1 / version 0) stays in its own group.
+/// - Subsequent updates by the same author within 1 hour (`GROUPING_WINDOW_SECS`) with at most
+///   one comment are merged into a single `CommentEntry` so attachments uploaded right before/after
+///   a comment are coalesced onto that comment.
+pub(crate) fn coalesce_issue_updates(
+    parsed_updates: Vec<RawIssueUpdate>,
     include_field_updates: bool,
-) -> Result<(Option<CommentEntry>, Vec<CommentEntry>, Vec<AttachmentMeta>)> {
-    let envelope = unwrap_named_envelope(root, "b.ListIssueUpdatesResponse")?;
-    let Some(it_resp) = envelope.get(1).and_then(Value::as_array) else {
-        return Ok((None, Vec::new(), Vec::new()));
-    };
-    let Some(raw_updates) = it_resp.first().and_then(Value::as_array) else {
-        return Ok((None, Vec::new(), Vec::new()));
-    };
-
-    #[derive(Debug)]
-    struct ParsedUpdate {
-        author: String,
-        timestamp: Option<DateTime<Utc>>,
-        comment: Option<CommentEntry>,
-        comment_number: Option<i32>,
-        version: Option<i64>,
-        attachments: Vec<AttachmentMeta>,
-        field_diffs: Vec<FieldDiff>,
-        is_initial: bool,
-    }
-
-    let mut parsed_updates: Vec<ParsedUpdate> = Vec::with_capacity(raw_updates.len());
-
-    for (idx, u_val) in raw_updates.iter().enumerate() {
-        let Some(u) = u_val.as_array() else {
-            continue;
-        };
-        let author = parse_user(u.first()).unwrap_or_else(|| "unknown".to_string());
-        let timestamp = parse_timestamp(u.get(1));
-        let comment_number = u.get(3).and_then(as_i64).map(|n| n as i32);
-        let version = u.get(6).and_then(as_i64);
-        let is_initial = idx == 0 || comment_number == Some(1) || version == Some(0);
-
-        let comment = u.get(2).and_then(Value::as_array).map(|c_arr| {
-            let mut entry = parse_issue_comment_array(c_arr, Some(author.clone()), timestamp);
-            if entry.comment_number.is_none() {
-                entry.comment_number = comment_number;
-            }
-            if entry.version.is_none() {
-                entry.version = version;
-            }
-            entry
-        });
-
-        let mut attachments = Vec::new();
-        if let Some(att_list) = u.get(7).and_then(Value::as_array) {
-            for att_val in att_list {
-                if let Some(att_arr) = att_val.as_array() {
-                    if let Some(meta) = parse_attachment_array(
-                        att_arr,
-                        issue_id,
-                        comment_number,
-                        usercontent_url,
-                    ) {
-                        attachments.push(meta);
-                    }
-                }
-            }
-        }
-
-        let field_diffs = parse_field_updates_array(u.get(5), custom_field_defs, is_initial);
-
-        parsed_updates.push(ParsedUpdate {
-            author,
-            timestamp,
-            comment,
-            comment_number,
-            version,
-            attachments,
-            field_diffs,
-            is_initial,
-        });
-    }
-
-    // Group updates using Buganizer's UpdateGroup rules:
-    // - Initial update (comment #1 / version 0) stays in its own group unless an immediate
-    //   same-author attachment-only update has no preceding comment #2+.
-    // - Subsequent updates by the same author within 1 hour with at most one comment
-    //   are merged into a single CommentEntry so attachments uploaded right before/after a
-    //   comment are attached to that comment.
+) -> (Option<CommentEntry>, Vec<CommentEntry>, Vec<AttachmentMeta>) {
     let mut groups: Vec<CommentEntry> = Vec::new();
 
     for upd in parsed_updates {
@@ -697,7 +647,11 @@ pub fn parse_updates_response(
                 (Some(t1), Some(t2)) => (t2 - t1).num_seconds().abs() <= GROUPING_WINDOW_SECS,
                 _ => true,
             };
-            !last_is_initial && !upd.is_initial && same_author && !both_have_comments && within_window
+            !last_is_initial
+                && !upd.is_initial
+                && same_author
+                && !both_have_comments
+                && within_window
         } else {
             false
         };
@@ -718,7 +672,6 @@ pub fn parse_updates_response(
                 att.comment_number = last.comment_number;
                 last.attachments.push(att);
             }
-            // Refresh comment_number on any earlier attachments in the group
             let resolved_num = last.comment_number;
             for att in &mut last.attachments {
                 if att.comment_number.is_none() {
@@ -779,29 +732,90 @@ pub fn parse_updates_response(
         }
     }
 
-    Ok((description, comments, all_attachments))
+    (description, comments, all_attachments)
 }
 
-fn parse_attachment_array(
-    att_arr: &[Value],
+/// Parses `b.ListIssueUpdatesResponse` from `POST /action/issues/{id}/updates`,
+/// coalescing attachment-only updates with adjacent comments by the same author.
+pub fn parse_updates_response(
+    root: &Value,
+    issue_id: i64,
+    usercontent_url: &str,
+    custom_field_defs: &CustomFieldDefMap,
+    include_field_updates: bool,
+) -> Result<(Option<CommentEntry>, Vec<CommentEntry>, Vec<AttachmentMeta>)> {
+    let envelope = unwrap_named_envelope(root, "b.ListIssueUpdatesResponse")?;
+    let Some(it_resp) = envelope.get(1).and_then(Value::as_array) else {
+        return Ok((None, Vec::new(), Vec::new()));
+    };
+    let Some(raw_updates) = it_resp.first().and_then(Value::as_array) else {
+        return Ok((None, Vec::new(), Vec::new()));
+    };
+
+    let mut parsed_updates: Vec<RawIssueUpdate> = Vec::with_capacity(raw_updates.len());
+
+    for (idx, u_val) in raw_updates.iter().enumerate() {
+        let Some(u) = u_val.as_array() else {
+            continue;
+        };
+        let author = parse_user(u.first()).unwrap_or_else(|| "unknown".to_string());
+        let timestamp = parse_timestamp(u.get(1));
+        let comment_number = u.get(3).and_then(as_i64).map(|n| n as i32);
+        let version = u.get(6).and_then(as_i64);
+        let is_initial = idx == 0 || comment_number == Some(1) || version == Some(0);
+
+        let comment = u.get(2).and_then(Value::as_array).map(|c_arr| {
+            let mut entry = parse_issue_comment_array(c_arr, Some(author.clone()), timestamp);
+            if entry.comment_number.is_none() {
+                entry.comment_number = comment_number;
+            }
+            if entry.version.is_none() {
+                entry.version = version;
+            }
+            entry
+        });
+
+        let mut attachments = Vec::new();
+        if let Some(att_list) = u.get(7).and_then(Value::as_array) {
+            for att_val in att_list {
+                if let Some(att_arr) = att_val.as_array() {
+                    if let Some(meta) =
+                        parse_attachment_array(att_arr, issue_id, comment_number, usercontent_url)
+                    {
+                        attachments.push(meta);
+                    }
+                }
+            }
+        }
+
+        let field_diffs = parse_field_updates_array(u.get(5), custom_field_defs, is_initial);
+
+        parsed_updates.push(RawIssueUpdate {
+            author,
+            timestamp,
+            comment,
+            comment_number,
+            version,
+            attachments,
+            field_diffs,
+            is_initial,
+        });
+    }
+
+    Ok(coalesce_issue_updates(parsed_updates, include_field_updates))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_attachment_meta(
+    attachment_id: i64,
     issue_id: i64,
     comment_number: Option<i32>,
+    raw_filename: String,
+    content_type: String,
+    size_bytes: u64,
+    is_deleted: bool,
     usercontent_url: &str,
-) -> Option<AttachmentMeta> {
-    let attachment_id = att_arr.first().and_then(as_i64)?;
-    let content_type = att_arr
-        .get(1)
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    let size_bytes = att_arr.get(2).and_then(as_u64).unwrap_or(0);
-    let raw_filename = att_arr
-        .get(3)
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("attachment.bin")
-        .to_string();
-
+) -> AttachmentMeta {
     let clean_name = sanitize_filename::sanitize(&raw_filename);
     let clean_name = if clean_name.is_empty() {
         "attachment.bin".to_string()
@@ -809,30 +823,19 @@ fn parse_attachment_array(
         clean_name
     };
     let sanitized_filename = format!("{}_{}", attachment_id, clean_name);
-
-    // tag 6 (index 5): `entity_status` -> `[status_enum]` where `1 = ACTIVE`, `2 = DELETED`, `3 = PURGED`
-    let status_code = att_arr
-        .get(5)
-        .and_then(Value::as_array)
-        .and_then(|a| a.first())
-        .and_then(as_i64)
-        .unwrap_or(1);
-    let is_deleted = status_code != 1;
-
     let download_url = format!(
         "{}/download/attachment/{}/{}?download=true",
         usercontent_url.trim_end_matches('/'),
         issue_id,
         attachment_id
     );
-
     let download_status = if is_deleted {
         AttachmentDownloadStatus::DeletedOnServer
     } else {
         AttachmentDownloadStatus::Skipped
     };
 
-    Some(AttachmentMeta {
+    AttachmentMeta {
         attachment_id,
         issue_id,
         comment_number,
@@ -845,12 +848,54 @@ fn parse_attachment_array(
         relative_path: None,
         local_path: None,
         download_status,
-    })
+    }
+}
+
+fn parse_attachment_array(
+    att_arr: &[Value],
+    issue_id: i64,
+    comment_number: Option<i32>,
+    usercontent_url: &str,
+) -> Option<AttachmentMeta> {
+    let attachment_id = att_arr.first().and_then(as_i64)?;
+    let content_type = att_arr
+        .get(1)
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let size_bytes = att_arr.get(2).and_then(as_u64).unwrap_or(0);
+    let raw_filename = att_arr
+        .get(3)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("attachment.bin")
+        .to_string();
+
+    // tag 6 (index 5): `entity_status` -> `[status_enum]` where `1 = ACTIVE`, `2 = DELETED`, `3 = PURGED`
+    let status_code = att_arr
+        .get(5)
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(as_i64)
+        .unwrap_or(1);
+    let is_deleted = status_code != 1;
+
+    Some(build_attachment_meta(
+        attachment_id,
+        issue_id,
+        comment_number,
+        raw_filename,
+        content_type,
+        size_bytes,
+        is_deleted,
+        usercontent_url,
+    ))
 }
 
 fn parse_field_updates_array(
     v: Option<&Value>,
-    custom_field_defs: &HashMap<i64, (String, String)>,
+    custom_field_defs: &CustomFieldDefMap,
     is_initial: bool,
 ) -> Vec<FieldDiff> {
     if is_initial {
@@ -870,9 +915,13 @@ fn parse_field_updates_array(
 
         // tag 3 (index 2): single_value_update `[old_any, new_any]`
         if let Some(single) = f_arr.get(2).and_then(Value::as_array) {
-            let old_val = format_proto_any(single.first(), field_name, custom_field_defs);
-            let new_val = format_proto_any(single.get(1), field_name, custom_field_defs);
-            let label = resolve_field_label(field_name, single.get(1).or(single.first()), custom_field_defs);
+            let old_val = format_proto_any(single.first(), field_name);
+            let new_val = format_proto_any(single.get(1), field_name);
+            let label = resolve_field_label(
+                field_name,
+                single.get(1).or(single.first()),
+                custom_field_defs,
+            );
             let summary = match (old_val, new_val) {
                 (Some(o), Some(n)) => format!("{} -> {}", o, n),
                 (None, Some(n)) => format!("set to {}", n),
@@ -891,7 +940,7 @@ fn parse_field_updates_array(
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
-                        .filter_map(|a| format_proto_any(Some(a), field_name, custom_field_defs))
+                        .filter_map(|a| format_proto_any(Some(a), field_name))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -900,32 +949,44 @@ fn parse_field_updates_array(
                 .and_then(Value::as_array)
                 .map(|list| {
                     list.iter()
-                        .filter_map(|a| format_proto_any(Some(a), field_name, custom_field_defs))
+                        .filter_map(|a| format_proto_any(Some(a), field_name))
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let mut parts = Vec::new();
-            if !added.is_empty() {
-                parts.push(format!("+{}", added.join(", +")));
-            }
-            if !removed.is_empty() {
-                parts.push(format!("-{}", removed.join(", -")));
-            }
-            if !parts.is_empty() {
-                diffs.push(FieldDiff {
-                    field: field_name.to_string(),
-                    summary: parts.join("; "),
-                });
+            if let Some(diff) = build_collection_diff(field_name, &added, &removed) {
+                diffs.push(diff);
             }
         }
     }
     diffs
 }
 
+pub(crate) fn build_collection_diff(
+    field_name: &str,
+    added: &[String],
+    removed: &[String],
+) -> Option<FieldDiff> {
+    let mut parts = Vec::new();
+    if !added.is_empty() {
+        parts.push(format!("+{}", added.join(", +")));
+    }
+    if !removed.is_empty() {
+        parts.push(format!("-{}", removed.join(", -")));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(FieldDiff {
+            field: field_name.to_string(),
+            summary: parts.join("; "),
+        })
+    }
+}
+
 fn resolve_field_label(
     field_name: &str,
     any_val: Option<&Value>,
-    custom_field_defs: &HashMap<i64, (String, String)>,
+    custom_field_defs: &CustomFieldDefMap,
 ) -> String {
     if field_name == "custom_fields" {
         if let Some(arr) = any_val.and_then(Value::as_array) {
@@ -942,11 +1003,17 @@ fn resolve_field_label(
     field_name.to_string()
 }
 
-fn format_proto_any(
-    any_val: Option<&Value>,
-    field_name: &str,
-    _custom_field_defs: &HashMap<i64, (String, String)>,
-) -> Option<String> {
+pub(crate) fn map_field_int_code(field_name: &str, code: i64) -> String {
+    match field_name {
+        "status" => map_status(code),
+        "priority" => map_priority(code),
+        "severity" => map_severity(code),
+        "type" => map_issue_type(code),
+        _ => code.to_string(),
+    }
+}
+
+fn format_proto_any(any_val: Option<&Value>, field_name: &str) -> Option<String> {
     let arr = any_val?.as_array()?;
     let type_url = arr.first()?.as_str()?;
     let payload = arr.get(1)?.as_array()?;
@@ -960,13 +1027,7 @@ fn format_proto_any(
     }
     if type_url.ends_with("Int32Value") || type_url.ends_with("Int64Value") {
         let code = payload.first().and_then(as_i64)?;
-        return Some(match field_name {
-            "status" => map_status(code),
-            "priority" => map_priority(code),
-            "severity" => map_severity(code),
-            "type" => map_issue_type(code),
-            _ => code.to_string(),
-        });
+        return Some(map_field_int_code(field_name, code));
     }
     if type_url.ends_with("StringValue") {
         return payload.first()?.as_str().map(ToOwned::to_owned);

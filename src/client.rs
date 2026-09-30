@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
 use std::fs::File;
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::cli::AuthMode;
@@ -11,9 +12,9 @@ use crate::jspb::{
     parse_component_response, parse_issue_fetch_response, parse_issue_search_response,
     parse_updates_response, parse_xssi_json,
 };
-use crate::models::{IssueBundle, SearchIssuesResult};
+use crate::models::{AttachmentMeta, CommentEntry, IssueBundle, SearchIssuesResult};
 use crate::protojson::{
-    parse_v1_component, parse_v1_issue, parse_v1_search_response, parse_v1_updates,
+    check_v1_error, parse_v1_component, parse_v1_issue, parse_v1_search_response, parse_v1_updates,
 };
 
 const CORP_API_BASE_URL: &str = "https://issuetracker.corp.googleapis.com/v1";
@@ -26,7 +27,7 @@ pub struct CrbugClient {
     base_url: String,
     usercontent_url: String,
     cookie: Option<String>,
-    corp_token: Option<String>,
+    corp_token: Option<Arc<RwLock<String>>>,
 }
 
 impl CrbugClient {
@@ -62,7 +63,7 @@ impl CrbugClient {
             }
         });
 
-        let corp_token = resolve_corp_token(auth_mode)?;
+        let corp_token = resolve_corp_token(auth_mode)?.map(|t| Arc::new(RwLock::new(t)));
 
         Ok(Self {
             agent,
@@ -76,6 +77,22 @@ impl CrbugClient {
     /// Returns true if the client has active corp authentication (`sso-cred-helper` + `sso_client`).
     pub fn is_corp_authenticated(&self) -> bool {
         self.corp_token.is_some()
+    }
+
+    fn current_corp_token(&self) -> Option<String> {
+        self.corp_token
+            .as_ref()
+            .map(|lock| lock.read().expect("corp_token lock poisoned").clone())
+    }
+
+    fn refresh_corp_token(&self) -> Option<String> {
+        invalidate_cached_token();
+        let fresh = mint_corp_token(AuthMode::Corp).ok()??;
+        write_cached_token(&fresh);
+        if let Some(ref lock) = self.corp_token {
+            *lock.write().expect("corp_token lock poisoned") = fresh.clone();
+        }
+        Some(fresh)
     }
 
     fn apply_common_headers(&self, req: ureq::Request) -> ureq::Request {
@@ -94,8 +111,8 @@ impl CrbugClient {
         sort_by: &str,
         limit: usize,
     ) -> Result<SearchIssuesResult> {
-        if let Some(ref token) = self.corp_token {
-            return self.search_issues_corp(token, query, sort_by, limit);
+        if self.is_corp_authenticated() {
+            return self.search_issues_corp(query, sort_by, limit);
         }
 
         let url = format!("{}/action/issues/list", self.base_url);
@@ -149,9 +166,7 @@ impl CrbugClient {
         }
 
         all_issues.truncate(target_limit);
-        if total_size < all_issues.len() {
-            total_size = all_issues.len();
-        }
+        total_size = total_size.max(all_issues.len());
 
         Ok(SearchIssuesResult {
             query: query.to_string(),
@@ -165,7 +180,6 @@ impl CrbugClient {
 
     fn search_issues_corp(
         &self,
-        token: &str,
         query: &str,
         sort_by: &str,
         limit: usize,
@@ -198,7 +212,7 @@ impl CrbugClient {
             }
 
             let val = self
-                .sso_get_json(&url, token)
+                .sso_get_json(&url)
                 .with_context(|| format!("Failed corp issue search for query '{}'", query))?;
 
             let page = parse_v1_search_response(&val, query, sort_by, &self.base_url)?;
@@ -214,9 +228,7 @@ impl CrbugClient {
         }
 
         all_issues.truncate(target_limit);
-        if total_size < all_issues.len() {
-            total_size = all_issues.len();
-        }
+        total_size = total_size.max(all_issues.len());
 
         Ok(SearchIssuesResult {
             query: query.to_string(),
@@ -236,16 +248,10 @@ impl CrbugClient {
         include_field_updates: bool,
         max_comments: Option<usize>,
     ) -> Result<IssueBundle> {
-        if let Some(ref token) = self.corp_token {
-            return self.fetch_issue_bundle_corp(
-                token,
-                issue_id,
-                include_field_updates,
-                max_comments,
-            );
+        if self.is_corp_authenticated() {
+            return self.fetch_issue_bundle_corp(issue_id, include_field_updates, max_comments);
         }
 
-        // Fetch issue state and updates concurrently using scoped OS threads
         let (issue_res, updates_res) = std::thread::scope(|s| {
             let issue_handle = s.spawn(|| self.fetch_issue_raw(issue_id));
             let updates_handle = s.spawn(|| self.fetch_updates_raw(issue_id));
@@ -269,7 +275,7 @@ impl CrbugClient {
             }
         }
 
-        let (desc_from_updates, mut comments, attachments) = parse_updates_response(
+        let updates = parse_updates_response(
             &updates_json,
             issue_id,
             &self.usercontent_url,
@@ -277,33 +283,18 @@ impl CrbugClient {
             include_field_updates,
         )?;
 
-        if desc_from_updates.is_some() {
-            bundle.description = desc_from_updates;
-        }
-
-        if let Some(limit) = max_comments {
-            if limit > 0 && comments.len() > limit {
-                let start = comments.len() - limit;
-                comments = comments.split_off(start);
-            }
-        }
-
-        bundle.comments = comments;
-        bundle.attachments = attachments;
-
-        Ok(bundle)
+        Ok(finalize_issue_bundle(bundle, updates, max_comments))
     }
 
     fn fetch_issue_bundle_corp(
         &self,
-        token: &str,
         issue_id: i64,
         include_field_updates: bool,
         max_comments: Option<usize>,
     ) -> Result<IssueBundle> {
         let (issue_res, updates_res) = std::thread::scope(|s| {
-            let issue_handle = s.spawn(|| self.fetch_issue_corp(token, issue_id));
-            let updates_handle = s.spawn(|| self.fetch_all_updates_corp(token, issue_id));
+            let issue_handle = s.spawn(|| self.fetch_issue_corp(issue_id));
+            let updates_handle = s.spawn(|| self.fetch_all_updates_corp(issue_id));
             (
                 issue_handle
                     .join()
@@ -320,12 +311,12 @@ impl CrbugClient {
         let (mut bundle, custom_field_defs) = parse_v1_issue(&issue_json, &self.base_url)?;
 
         if bundle.component_id > 0 {
-            if let Ok(comp_json) = self.fetch_component_corp(token, bundle.component_id) {
+            if let Ok(comp_json) = self.fetch_component_corp(bundle.component_id) {
                 bundle.component_path = parse_v1_component(&comp_json);
             }
         }
 
-        let (desc_from_updates, mut comments, attachments) = parse_v1_updates(
+        let updates = parse_v1_updates(
             &updates_list,
             issue_id,
             &self.usercontent_url,
@@ -333,30 +324,16 @@ impl CrbugClient {
             include_field_updates,
         )?;
 
-        if desc_from_updates.is_some() {
-            bundle.description = desc_from_updates;
-        }
-
-        if let Some(limit) = max_comments {
-            if limit > 0 && comments.len() > limit {
-                let start = comments.len() - limit;
-                comments = comments.split_off(start);
-            }
-        }
-
-        bundle.comments = comments;
-        bundle.attachments = attachments;
-
-        Ok(bundle)
+        Ok(finalize_issue_bundle(bundle, updates, max_comments))
     }
 
-    fn fetch_issue_corp(&self, token: &str, issue_id: i64) -> Result<Value> {
+    fn fetch_issue_corp(&self, issue_id: i64) -> Result<Value> {
         let url = format!("{}/issues/{}?view=FULL", CORP_API_BASE_URL, issue_id);
-        self.sso_get_json(&url, token)
+        self.sso_get_json(&url)
             .with_context(|| format!("Failed to fetch issue {} via corp API", issue_id))
     }
 
-    fn fetch_all_updates_corp(&self, token: &str, issue_id: i64) -> Result<Vec<Value>> {
+    fn fetch_all_updates_corp(&self, issue_id: i64) -> Result<Vec<Value>> {
         let mut all_updates = Vec::new();
         let mut page_token: Option<String> = None;
 
@@ -372,7 +349,7 @@ impl CrbugClient {
                 }
             }
 
-            let val = self.sso_get_json(&url, token).with_context(|| {
+            let val = self.sso_get_json(&url).with_context(|| {
                 format!("Failed to fetch updates for issue {} via corp API", issue_id)
             })?;
 
@@ -398,19 +375,20 @@ impl CrbugClient {
         Ok(all_updates)
     }
 
-    fn fetch_component_corp(&self, token: &str, component_id: i64) -> Result<Value> {
+    fn fetch_component_corp(&self, component_id: i64) -> Result<Value> {
         let url = format!("{}/components/{}", CORP_API_BASE_URL, component_id);
-        self.sso_get_json(&url, token)
+        self.sso_get_json(&url)
     }
 
-    fn sso_get_json(&self, url: &str, token: &str) -> Result<Value> {
-        match self.sso_get_json_once(url, token) {
+    fn sso_get_json(&self, url: &str) -> Result<Value> {
+        let token = self
+            .current_corp_token()
+            .ok_or_else(|| anyhow!("Missing corp authentication token"))?;
+
+        match self.sso_get_json_once(url, &token) {
             Ok(val) => Ok(val),
             Err(err) if err.to_string().contains("HTTP 401") => {
-                // Self-heal if a cached token was revoked or expired early
-                invalidate_cached_token();
-                if let Ok(Some(fresh_token)) = mint_corp_token(AuthMode::Corp) {
-                    write_cached_token(&fresh_token);
+                if let Some(fresh_token) = self.refresh_corp_token() {
                     return self.sso_get_json_once(url, &fresh_token);
                 }
                 Err(err)
@@ -452,24 +430,7 @@ impl CrbugClient {
             )
         })?;
 
-        if let Some(err_obj) = val.get("error") {
-            let code = err_obj.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let status = err_obj
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or("UNKNOWN");
-            let message = err_obj
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown API error");
-            return Err(anyhow!(
-                "Corp API error (HTTP {} {}): {}",
-                code,
-                status,
-                message
-            ));
-        }
-
+        check_v1_error(&val)?;
         Ok(val)
     }
 
@@ -525,8 +486,8 @@ impl CrbugClient {
         attachment_id: i64,
         dest_path: &Path,
     ) -> Result<u64> {
-        if let Some(ref token) = self.corp_token {
-            return self.download_attachment_corp(token, issue_id, attachment_id, dest_path);
+        if self.is_corp_authenticated() {
+            return self.download_attachment_corp(issue_id, attachment_id, dest_path);
         }
 
         let primary_url = format!(
@@ -551,16 +512,27 @@ impl CrbugClient {
             }
         })?;
 
-        let tmp_path = dest_path.with_extension("part");
+        let tmp_path = part_path_for(dest_path);
         let file = File::create(&tmp_path)
             .with_context(|| format!("Failed to create temporary file {}", tmp_path.display()))?;
         let mut writer = BufWriter::new(file);
         let mut reader = resp.into_reader();
 
-        let written = std::io::copy(&mut reader, &mut writer)
-            .context("Error reading attachment byte stream")?;
-        std::io::Write::flush(&mut writer)?;
+        let copy_res = std::io::copy(&mut reader, &mut writer)
+            .context("Error reading attachment byte stream")
+            .and_then(|written| {
+                std::io::Write::flush(&mut writer)?;
+                Ok(written)
+            });
         drop(writer);
+
+        let written = match copy_res {
+            Ok(n) => n,
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        };
 
         std::fs::rename(&tmp_path, dest_path).with_context(|| {
             format!(
@@ -575,6 +547,33 @@ impl CrbugClient {
 
     fn download_attachment_corp(
         &self,
+        issue_id: i64,
+        attachment_id: i64,
+        dest_path: &Path,
+    ) -> Result<u64> {
+        let token = self
+            .current_corp_token()
+            .ok_or_else(|| anyhow!("Missing corp authentication token"))?;
+
+        match self.download_attachment_corp_once(&token, issue_id, attachment_id, dest_path) {
+            Ok(written) => Ok(written),
+            Err(err) if err.to_string().contains("401") => {
+                if let Some(fresh_token) = self.refresh_corp_token() {
+                    return self.download_attachment_corp_once(
+                        &fresh_token,
+                        issue_id,
+                        attachment_id,
+                        dest_path,
+                    );
+                }
+                Err(err)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn download_attachment_corp_once(
+        &self,
         token: &str,
         issue_id: i64,
         attachment_id: i64,
@@ -586,7 +585,7 @@ impl CrbugClient {
         );
         let auth_header = format!("Authorization: Bearer {}", token);
 
-        let tmp_path = dest_path.with_extension("part");
+        let tmp_path = part_path_for(dest_path);
         let file = File::create(&tmp_path)
             .with_context(|| format!("Failed to create temporary file {}", tmp_path.display()))?;
         let mut writer = BufWriter::new(file);
@@ -608,25 +607,35 @@ impl CrbugClient {
             .take()
             .ok_or_else(|| anyhow!("Failed to capture stdout of sso_client"))?;
 
-        let written = std::io::copy(&mut child_stdout, &mut writer)
-            .context("Error streaming attachment bytes from sso_client")?;
-        std::io::Write::flush(&mut writer)?;
+        let copy_res = std::io::copy(&mut child_stdout, &mut writer)
+            .context("Error streaming attachment bytes from sso_client")
+            .and_then(|written| {
+                std::io::Write::flush(&mut writer)?;
+                Ok(written)
+            });
         drop(writer);
 
         let output = child
             .wait_with_output()
             .context("Failed waiting for sso_client attachment download")?;
 
-        if !output.status.success() {
-            let _ = std::fs::remove_file(&tmp_path);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!(
-                "Failed to download attachment {} for issue {} via corp API: {}",
-                attachment_id,
-                issue_id,
-                stderr.trim()
-            ));
-        }
+        let written = match copy_res {
+            Ok(n) if output.status.success() => n,
+            Ok(_) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!(
+                    "Failed to download attachment {} for issue {} via corp API: {}",
+                    attachment_id,
+                    issue_id,
+                    stderr.trim()
+                ));
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+        };
 
         std::fs::rename(&tmp_path, dest_path).with_context(|| {
             format!(
@@ -640,6 +649,35 @@ impl CrbugClient {
     }
 }
 
+fn finalize_issue_bundle(
+    mut bundle: IssueBundle,
+    updates: (Option<CommentEntry>, Vec<CommentEntry>, Vec<AttachmentMeta>),
+    max_comments: Option<usize>,
+) -> IssueBundle {
+    let (desc_from_updates, mut comments, attachments) = updates;
+
+    if desc_from_updates.is_some() {
+        bundle.description = desc_from_updates;
+    }
+
+    if let Some(limit) = max_comments {
+        if limit > 0 && comments.len() > limit {
+            let start = comments.len() - limit;
+            comments = comments.split_off(start);
+        }
+    }
+
+    bundle.comments = comments;
+    bundle.attachments = attachments;
+    bundle
+}
+
+fn part_path_for(dest_path: &Path) -> PathBuf {
+    let mut os = dest_path.as_os_str().to_os_string();
+    os.push(".part");
+    PathBuf::from(os)
+}
+
 const TOKEN_CACHE_TTL_SECS: u64 = 55 * 60;
 
 fn current_unix_secs() -> u64 {
@@ -649,7 +687,7 @@ fn current_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn token_cache_path() -> std::path::PathBuf {
+fn token_cache_path() -> PathBuf {
     let raw_user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "default".to_string());
@@ -671,9 +709,14 @@ fn read_cached_token() -> Option<String> {
     let meta = std::fs::metadata(&path).ok()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         if meta.permissions().mode() & 0o077 != 0 {
             return None;
+        }
+        if let Ok(self_meta) = std::fs::metadata("/proc/self") {
+            if meta.uid() != self_meta.uid() {
+                return None;
+            }
         }
     }
     let data = std::fs::read(&path).ok()?;
